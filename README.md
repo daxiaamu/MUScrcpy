@@ -14,7 +14,7 @@ MU投屏是一款面向 Windows 的轻量 Android 投屏启动器，基于 [scrc
 - 断线等待和自动重新投屏
 - 实时运行日志
 
-更完整的功能介绍见 [BLOG.md](BLOG.md)。
+完整的功能介绍见 [optool.daxiaamu.com/muscrcpy](https://optool.daxiaamu.com/muscrcpy)。
 
 ## 运行
 
@@ -41,9 +41,3 @@ gcc start_scrcpy_c.c start_scrcpy_c.res -municode -mwindows -O2 -s -o MUScrcpy.e
 ## 第三方项目
 
 投屏、设备控制和音视频传输由 [Genymobile/scrcpy](https://github.com/Genymobile/scrcpy) 提供。请同时遵守 scrcpy 及其发布包内第三方组件的许可证。
-
-## 作者
-
-大侠阿木 · [daxiaamu.com](https://daxiaamu.com)
-
-检查更新：[optool.daxiaamu.com/muscrcpy](https://optool.daxiaamu.com/muscrcpy)
