@@ -3,8 +3,9 @@ MUScrcpy.exe
 MUScrcpy_new.exe
 *.res
 
-# Bundled third-party runtime
-bin/
+# Bundled third-party runtime (keep only its update guide in source control)
+bin/*
+!bin/README.md
 
 # Local tooling
 .agents/
