@@ -72,6 +72,7 @@ static BOOL scroll_hover;
 static HWND hot_button;
 static WNDPROC button_window_proc;
 static BOOL quality_combo_hover;
+static BOOL suppress_outside_click_up;
 
 enum { QUALITY_AUTO, QUALITY_SMOOTH, QUALITY_BALANCED, QUALITY_HIGH, QUALITY_ULTRA };
 
@@ -424,24 +425,12 @@ static void launch_scrcpy(void) {
     if (WaitForSingleObject(stop_event, 0) != WAIT_OBJECT_0) post_log(L"scrcpy 已退出，准备重新连接。");
 }
 
-static DWORD WINAPI launcher_worker(LPVOID ignored) {
-    B…4850 tokens truncated…",WS_CHILD|WS_VISIBLE|SS_CENTER,
-                            (width-title_width)/2,119,title_width,38,hwnd,(HMENU)IDC_ABOUT_TITLE,app_instance,NULL);
-        info=CreateWindowW(L"STATIC",L"v" APP_VERSION L"  ·  大侠阿木",WS_CHILD|WS_VISIBLE|SS_CENTER,
-                           (width-info_width)/2,166,info_width,24,hwnd,(HMENU)IDC_ABOUT_INFO,app_instance,NULL);
-        link=create_button(hwnd,L"检查更新",IDC_ABOUT_UPDATE);
-        MoveWindow(link,(width-link_width)/2,225,link_width,36,TRUE);
-        SendMessageW(title,WM_SETFONT,(WPARAM)(font_about_title?font_about_title:font_bold),TRUE);
-        SendMessageW(info,WM_SETFONT,(WPARAM)font_normal,TRUE);return 0;
-    }
-    case WM_ERASEBKGND:return 1;
-    case WM_PAINT:{
-        PAINTSTRUCT ps;RECT client;HDC dc=BeginPaint(hwnd,&ps);GetClientRect(hwnd,&client);
-        FillRect(dc,&client,brush_bg);EndPaint(hwnd,&ps);return 0;
-    }
-    case WM_COMMAND:
-        if(LOWORD(wparam)==IDC_ABOUT_UPDATE){open_update_page(hwnd);return 0;}
-        if(LOWORD(wparam)==IDCANCEL){DestroyWindow(hwnd);return 0;}break;
+static DWORD WINAPI …5268 tokens truncated…troyWindow(hwnd);return 0;}break;
+    case WM_LBUTTONDOWN:case WM_RBUTTONDOWN:case WM_MBUTTONDOWN:
+        DestroyWindow(hwnd);return 0;
+    case WM_ACTIVATE:
+        if(LOWORD(wparam)==WA_INACTIVE)DestroyWindow(hwnd);
+        return 0;
     case WM_DRAWITEM:
         if(wparam==IDC_ABOUT_UPDATE){draw_owner_button((const DRAWITEMSTRUCT*)lparam);return TRUE;}break;
     case WM_CTLCOLORSTATIC:
@@ -460,7 +449,7 @@ static DWORD WINAPI launcher_worker(LPVOID ignored) {
 }
 
 static void show_about_window(HWND owner){
-    static BOOL registered;WNDCLASSW wc;RECT owner_rect;int width=380,height=330,x=CW_USEDEFAULT,y=CW_USEDEFAULT;HWND dialog;MSG message;
+    static BOOL registered;WNDCLASSW wc;RECT owner_rect;int width=380,height=330,x=CW_USEDEFAULT,y=CW_USEDEFAULT;HWND dialog;
     if(about_window&&IsWindow(about_window)){SetForegroundWindow(about_window);return;}
     if(!registered){
         ZeroMemory(&wc,sizeof(wc));wc.lpfnWndProc=about_proc;wc.hInstance=app_instance;
@@ -478,9 +467,6 @@ static void show_about_window(HWND owner){
                            owner,NULL,app_instance,owner);
     if(!dialog)return;
     about_window=dialog;ShowWindow(dialog,SW_SHOW);UpdateWindow(dialog);
-    while(IsWindow(dialog)&&GetMessageW(&message,NULL,0,0)){
-        if(!IsDialogMessageW(dialog,&message)){TranslateMessage(&message);DispatchMessageW(&message);}
-    }
 }
 
 static void refresh_status_text(void){
@@ -730,6 +716,20 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE previous,LPWSTR command_line,in
     main_window=CreateWindowExW(0,wc.lpszClassName,APP_TITLE,WS_OVERLAPPEDWINDOW&~WS_MAXIMIZEBOX,CW_USEDEFAULT,CW_USEDEFAULT,700,660,NULL,NULL,instance,NULL);
     if(!main_window) return 1;
     ShowWindow(main_window,show);UpdateWindow(main_window);
-    while(GetMessageW(&message,NULL,0,0)>0){TranslateMessage(&message);DispatchMessageW(&message);}
+    while(GetMessageW(&message,NULL,0,0)>0){
+        BOOL mouse_down=message.message==WM_LBUTTONDOWN||message.message==WM_RBUTTONDOWN||message.message==WM_MBUTTONDOWN||
+                        message.message==WM_NCLBUTTONDOWN||message.message==WM_NCRBUTTONDOWN||message.message==WM_NCMBUTTONDOWN;
+        BOOL mouse_up=message.message==WM_LBUTTONUP||message.message==WM_RBUTTONUP||message.message==WM_MBUTTONUP||
+                      message.message==WM_NCLBUTTONUP||message.message==WM_NCRBUTTONUP||message.message==WM_NCMBUTTONUP;
+        if(suppress_outside_click_up&&mouse_up){suppress_outside_click_up=FALSE;continue;}
+        if(about_window&&IsWindow(about_window)){
+            if(message.message==WM_KEYDOWN&&message.wParam==VK_ESCAPE){DestroyWindow(about_window);continue;}
+            if(mouse_down&&message.hwnd!=about_window&&!IsChild(about_window,message.hwnd)){
+                DestroyWindow(about_window);suppress_outside_click_up=TRUE;continue;
+            }
+            if(IsDialogMessageW(about_window,&message))continue;
+        }
+        TranslateMessage(&message);DispatchMessageW(&message);
+    }
     CloseHandle(stop_event);CloseHandle(mutex_handle);DeleteCriticalSection(&process_lock);return(int)message.wParam;
 }
