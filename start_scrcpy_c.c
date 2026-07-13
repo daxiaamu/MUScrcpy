@@ -30,6 +30,7 @@
 #define IDC_ABOUT_TITLE 2202
 #define IDC_ABOUT_INFO 2203
 #define IDC_ABOUT_UPDATE 2204
+#define IDC_ABOUT_SCRCPY 2205
 
 #define CLR_BG RGB(246,247,249)
 #define CLR_CARD RGB(255,255,255)
@@ -66,6 +67,7 @@ static volatile LONG always_on_top_mode;
 static volatile LONG quality_mode;
 static volatile LONG workers_started;
 static wchar_t bin_dir[MAX_PATH];
+static wchar_t scrcpy_version[80]=L"未检测";
 static wchar_t current_status[200]=L"正在初始化";
 static int scroll_drag_offset = -1;
 static BOOL scroll_hover;
@@ -145,6 +147,42 @@ static BOOL initialize_bin_directory(void) {
     _snwprintf(adb, ARRAYSIZE(adb)-1, L"%ls\\adb.exe", bin_dir);
     _snwprintf(scrcpy, ARRAYSIZE(scrcpy)-1, L"%ls\\scrcpy.exe", bin_dir);
     return GetFileAttributesW(adb) != INVALID_FILE_ATTRIBUTES && GetFileAttributesW(scrcpy) != INVALID_FILE_ATTRIBUTES;
+}
+
+static void detect_scrcpy_version(void) {
+    SECURITY_ATTRIBUTES sa;
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    HANDLE read_pipe = NULL, write_pipe = NULL;
+    wchar_t exe[MAX_PATH], command[MAX_PATH+32], output[512], *version, *end;
+    char bytes[1024];
+    DWORD used = 0, read = 0, wait_result;
+    ZeroMemory(&sa,sizeof(sa));sa.nLength=sizeof(sa);sa.bInheritHandle=TRUE;
+    if(!CreatePipe(&read_pipe,&write_pipe,&sa,0))return;
+    SetHandleInformation(read_pipe,HANDLE_FLAG_INHERIT,0);
+    _snwprintf(exe,ARRAYSIZE(exe)-1,L"%ls\\scrcpy.exe",bin_dir);
+    _snwprintf(command,ARRAYSIZE(command)-1,L"\"%ls\" --version",exe);
+    command[ARRAYSIZE(command)-1]=0;
+    ZeroMemory(&si,sizeof(si));ZeroMemory(&pi,sizeof(pi));si.cb=sizeof(si);
+    si.dwFlags=STARTF_USESHOWWINDOW|STARTF_USESTDHANDLES;si.wShowWindow=SW_HIDE;
+    si.hStdOutput=write_pipe;si.hStdError=write_pipe;si.hStdInput=GetStdHandle(STD_INPUT_HANDLE);
+    if(!CreateProcessW(NULL,command,NULL,NULL,TRUE,CREATE_NO_WINDOW,NULL,bin_dir,&si,&pi)){
+        CloseHandle(read_pipe);CloseHandle(write_pipe);return;
+    }
+    CloseHandle(write_pipe);write_pipe=NULL;
+    wait_result=WaitForSingleObject(pi.hProcess,3000);
+    if(wait_result==WAIT_TIMEOUT){TerminateProcess(pi.hProcess,2);WaitForSingleObject(pi.hProcess,1000);}
+    while(used<sizeof(bytes)-1&&ReadFile(read_pipe,bytes+used,(DWORD)(sizeof(bytes)-1-used),&read,NULL)&&read)used+=read;
+    bytes[used]=0;utf8_or_acp_to_wide(bytes,used,output,ARRAYSIZE(output));
+    version=wcsstr(output,L"scrcpy ");
+    if(version){
+        size_t length;
+        version+=7;while(*version==L' '||*version==L'\t')++version;
+        end=version;while(*end&&*end!=L' '&&*end!=L'\t'&&*end!=L'\r'&&*end!=L'\n'&&*end!=L'<')++end;
+        length=(size_t)(end-version);if(length>=ARRAYSIZE(scrcpy_version))length=ARRAYSIZE(scrcpy_version)-1;
+        if(length){memcpy(scrcpy_version,version,length*sizeof(wchar_t));scrcpy_version[length]=0;}
+    }
+    CloseHandle(read_pipe);CloseHandle(pi.hThread);CloseHandle(pi.hProcess);
 }
 
 static BOOL run_adb(const wchar_t *args, wchar_t *output, size_t capacity, DWORD timeout) {
@@ -394,48 +432,15 @@ static void launch_scrcpy(void) {
     _snwprintf(exe, ARRAYSIZE(exe)-1, L"%ls\\scrcpy.exe", bin_dir);
     _snwprintf(command, ARRAYSIZE(command)-1, L"\"%ls\"", exe);
     command[ARRAYSIZE(command)-1] = 0;
-    if (compatible) wcscat(command,L" -d --render-driver=software --no-audio");
-    if (stay_awake) wcscat(command,L" --stay-awake");
-    if (always_on_top) wcscat(command,L" --always-on-top");
-    append_quality_options(command,effective_quality);
-    ZeroMemory(&si, sizeof(si)); ZeroMemory(&pi, sizeof(pi)); si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES; si.wShowWindow = SW_HIDE;
-    si.hStdOutput = write_pipe; si.hStdError = write_pipe; si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-    if(selected_quality==QUALITY_AUTO) {
-        if(effective_quality==QUALITY_SMOOTH) post_log(L"自动画质已选择：流畅。");
-        else if(effective_quality==QUALITY_HIGH) post_log(L"自动画质已选择：高清。");
-        else post_log(L"自动画质已选择：均衡。");
-    }
-    if (compatible && stay_awake) post_log(L"正在以兼容模式启动 scrcpy（保持亮屏）…");
-    else if (compatible) post_log(L"正在以兼容模式启动 scrcpy…");
-    else if (stay_awake) post_log(L"正在启动 scrcpy（保持亮屏）…");
-    else post_log(L"正在无参数启动 scrcpy…");
-    if (!CreateProcessW(NULL, command, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, bin_dir, &si, &pi)) {
-        post_log(L"scrcpy.exe 启动失败，请检查 bin 目录。"); CloseHandle(read_pipe); CloseHandle(write_pipe); Sleep(1000); return;
-    }
-    CloseHandle(write_pipe);
-    EnterCriticalSection(&process_lock); scrcpy_process = pi.hProcess; scrcpy_process_id=pi.dwProcessId; LeaveCriticalSection(&process_lock);
-    PostMessageW(main_window,WM_APP_DOCK_SCRCPY,0,0);
-    post_status(compatible ? L"兼容模式投屏中" : L"正在投屏");
-    forward_scrcpy_output(pi.hProcess, read_pipe);
-    WaitForSingleObject(pi.hProcess, 1000);
-    EnterCriticalSection(&process_lock); scrcpy_process = NULL; scrcpy_process_id=0; LeaveCriticalSection(&process_lock);
-    docked_scrcpy_window=NULL;
-    CloseHandle(read_pipe); CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
-    if (WaitForSingleObject(stop_event, 0) != WAIT_OBJECT_0) post_log(L"scrcpy 已退出，准备重新连接。");
-}
-
-static DWORD WINAPI …5268 tokens truncated…troyWindow(hwnd);return 0;}break;
-    case WM_LBUTTONDOWN:case WM_RBUTTONDOWN:case WM_MBUTTONDOWN:
-        DestroyWindow(hwnd);return 0;
-    case WM_ACTIVATE:
-        if(LOWORD(wparam)==WA_INACTIVE)DestroyWindow(hwnd);
+    if (compatible) wcscat(command,L" …5994 tokens truncated…PtrW(hwnd,GWLP_USERDATA);
+            if(next!=owner_window&&!IsChild(hwnd,next))DestroyWindow(hwnd);
+        }
         return 0;
     case WM_DRAWITEM:
         if(wparam==IDC_ABOUT_UPDATE){draw_owner_button((const DRAWITEMSTRUCT*)lparam);return TRUE;}break;
     case WM_CTLCOLORSTATIC:
         SetBkMode((HDC)wparam,TRANSPARENT);
-        SetTextColor((HDC)wparam,GetDlgCtrlID((HWND)lparam)==IDC_ABOUT_INFO?CLR_MUTED:CLR_TEXT);
+        SetTextColor((HDC)wparam,(GetDlgCtrlID((HWND)lparam)==IDC_ABOUT_INFO||GetDlgCtrlID((HWND)lparam)==IDC_ABOUT_SCRCPY)?CLR_MUTED:CLR_TEXT);
         return (LRESULT)brush_bg;
     case WM_CLOSE:DestroyWindow(hwnd);return 0;
     case WM_DESTROY:
@@ -707,6 +712,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE previous,LPWSTR command_line,in
     }
     load_preferences();
     InitializeCriticalSection(&process_lock);stop_event=CreateEventW(NULL,TRUE,FALSE,NULL);InitCommonControls();
+    if(initialize_bin_directory())detect_scrcpy_version();
     ZeroMemory(&wc,sizeof(wc));wc.cbSize=sizeof(wc);wc.style=CS_HREDRAW|CS_VREDRAW;wc.hInstance=instance;wc.lpfnWndProc=window_proc;wc.lpszClassName=L"MUScrcpyGuiWindow";
     wc.hCursor=LoadCursor(NULL,IDC_ARROW);wc.hIcon=LoadIcon(instance,MAKEINTRESOURCE(1));wc.hIconSm=wc.hIcon;wc.hbrBackground=(HBRUSH)(COLOR_WINDOW+1);
     if(!RegisterClassExW(&wc))return 1;
