@@ -47,4 +47,3 @@ gcc start_scrcpy_c.c start_scrcpy_c.res -municode -mwindows -O2 -s -o MUScrcpy.e
 大侠阿木 · [daxiaamu.com](https://daxiaamu.com)
 
 检查更新：[optool.daxiaamu.com/muscrcpy](https://optool.daxiaamu.com/muscrcpy)
-

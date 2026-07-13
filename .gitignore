@@ -1,0 +1,15 @@
+# Build outputs
+MUScrcpy.exe
+MUScrcpy_new.exe
+*.res
+
+# Bundled third-party runtime
+bin/
+
+# Local tooling
+.agents/
+.codex/
+
+# Design references and large source exports
+assets/icons/*-source.png
+assets/icons/superadb-reference.png
