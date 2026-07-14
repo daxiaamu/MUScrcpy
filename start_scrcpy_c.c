@@ -5,7 +5,7 @@
 #include <stdio.h>
 #include <wchar.h>
 
-#define APP_VERSION L"2.3.1"
+#define APP_VERSION L"2.3.2"
 #define APP_TITLE L"MU投屏 " APP_VERSION L" daxiaamu.com"
 #define APP_MUTEX L"Daxiaamu.MUScrcpy.GUI.SingleInstance"
 #define WM_APP_LOG (WM_APP + 1)
@@ -312,6 +312,24 @@ static void terminate_scrcpy(void) {
 
 typedef struct { DWORD process_id; HWND window; } WindowSearch;
 
+typedef HANDLE (WINAPI *SetThreadDpiAwarenessContextFn)(HANDLE);
+static SetThreadDpiAwarenessContextFn set_thread_dpi_context;
+
+static HANDLE enter_physical_dpi_context(void) {
+    static BOOL initialized;
+    if(!initialized){
+        HMODULE user32=GetModuleHandleW(L"user32.dll");
+        union { FARPROC raw; SetThreadDpiAwarenessContextFn call; } function;
+        function.raw=user32?GetProcAddress(user32,"SetThreadDpiAwarenessContext"):NULL;
+        set_thread_dpi_context=function.call;initialized=TRUE;
+    }
+    return set_thread_dpi_context?set_thread_dpi_context((HANDLE)(LONG_PTR)-4):NULL;
+}
+
+static void leave_physical_dpi_context(HANDLE previous) {
+    if(set_thread_dpi_context&&previous)set_thread_dpi_context(previous);
+}
+
 static void get_visible_window_rect(HWND window, RECT *rect) {
     typedef HRESULT (WINAPI *DwmGetWindowAttributeFn)(HWND,DWORD,PVOID,DWORD);
     static BOOL initialized;
@@ -349,25 +367,66 @@ static HWND find_scrcpy_window(void) {
     return search.window;
 }
 
-static BOOL dock_scrcpy_window(HWND gui, BOOL bring_forward) {
-    HWND scrcpy=find_scrcpy_window();
-    RECT gui_rect,gui_visible,scrcpy_rect,scrcpy_visible;
-    MONITORINFO monitor_info;
+static int choose_dock_side(const RECT *gui_visible, int scrcpy_width, const RECT *work_area) {
+    if(gui_visible->right+scrcpy_width<=work_area->right)return 1;
+    if(gui_visible->left-scrcpy_width>=work_area->left)return -1;
+    return work_area->right-gui_visible->right>=gui_visible->left-work_area->left?1:-1;
+}
+
+static BOOL get_window_work_area(HWND window,RECT *work_area) {
+    MONITORINFO info;HMONITOR found=MonitorFromWindow(window,MONITOR_DEFAULTTONEAREST);
+    ZeroMemory(&info,sizeof(info));info.cbSize=sizeof(info);
+    if(!found||!GetMonitorInfoW(found,&info))return FALSE;
+    *work_area=info.rcWork;
+    return TRUE;
+}
+
+static void keep_window_in_work_area(const RECT *work_area,const RECT *window_rect,
+                                     const RECT *visible_rect,int *x,int *y) {
+    int visible_width=visible_rect->right-visible_rect->left;
+    int visible_height=visible_rect->bottom-visible_rect->top;
+    int work_width=work_area->right-work_area->left;
+    int work_height=work_area->bottom-work_area->top;
+    int visible_x=*x+(visible_rect->left-window_rect->left);
+    int visible_y=*y+(visible_rect->top-window_rect->top);
+    if(visible_width<=work_width){
+        if(visible_x<work_area->left)visible_x=work_area->left;
+        if(visible_x+visible_width>work_area->right)visible_x=work_area->right-visible_width;
+    }else visible_x=work_area->left;
+    if(visible_height<=work_height){
+        if(visible_y<work_area->top)visible_y=work_area->top;
+        if(visible_y+visible_height>work_area->bottom)visible_y=work_area->bottom-visible_height;
+    }else visible_y=work_area->top;
+    *x=visible_x-(visible_rect->left-window_rect->left);
+    *y=visible_y-(visible_rect->top-window_rect->top);
+}
+
+static BOOL position_scrcpy_window(HWND gui,HWND scrcpy,HWND insert_after,UINT flags) {
+    RECT gui_visible,scrcpy_rect,scrcpy_visible,work_area;
+    HANDLE previous_dpi_context;
     int scrcpy_width,x,y;
-    if(!scrcpy||!IsWindow(scrcpy)||IsIconic(gui))return FALSE;
-    if(IsIconic(scrcpy))ShowWindow(scrcpy,SW_SHOWNOACTIVATE);
-    GetWindowRect(gui,&gui_rect);GetWindowRect(scrcpy,&scrcpy_rect);
+    previous_dpi_context=enter_physical_dpi_context();
+    GetWindowRect(scrcpy,&scrcpy_rect);
     get_visible_window_rect(gui,&gui_visible);get_visible_window_rect(scrcpy,&scrcpy_visible);
     scrcpy_width=scrcpy_visible.right-scrcpy_visible.left;
-    ZeroMemory(&monitor_info,sizeof(monitor_info));monitor_info.cbSize=sizeof(monitor_info);
-    GetMonitorInfoW(MonitorFromWindow(gui,MONITOR_DEFAULTTONEAREST),&monitor_info);
-    if(gui_visible.right+scrcpy_width<=monitor_info.rcWork.right)dock_side=1;
-    else if(gui_visible.left-scrcpy_width>=monitor_info.rcWork.left)dock_side=-1;
-    else dock_side=(monitor_info.rcWork.right-gui_visible.right>=gui_visible.left-monitor_info.rcWork.left)?1:-1;
+    if(!get_window_work_area(gui,&work_area)){
+        leave_physical_dpi_context(previous_dpi_context);return FALSE;
+    }
+    dock_side=choose_dock_side(&gui_visible,scrcpy_width,&work_area);
     x=dock_side>0?gui_visible.right-(scrcpy_visible.left-scrcpy_rect.left):
                    gui_visible.left-scrcpy_width-(scrcpy_visible.left-scrcpy_rect.left);
     y=scrcpy_rect.top;
-    SetWindowPos(scrcpy,HWND_TOP,x,y,0,0,SWP_NOSIZE|SWP_NOACTIVATE|SWP_SHOWWINDOW);
+    keep_window_in_work_area(&work_area,&scrcpy_rect,&scrcpy_visible,&x,&y);
+    SetWindowPos(scrcpy,insert_after,x,y,0,0,flags|SWP_NOSIZE);
+    leave_physical_dpi_context(previous_dpi_context);
+    return TRUE;
+}
+
+static BOOL dock_scrcpy_window(HWND gui, BOOL bring_forward) {
+    HWND scrcpy=find_scrcpy_window();
+    if(!scrcpy||!IsWindow(scrcpy)||IsIconic(gui))return FALSE;
+    if(IsIconic(scrcpy))ShowWindow(scrcpy,SW_SHOWNOACTIVATE);
+    if(!position_scrcpy_window(gui,scrcpy,HWND_TOP,SWP_NOACTIVATE|SWP_SHOWWINDOW))return FALSE;
     docked_scrcpy_window=scrcpy;
     if(bring_forward){
         SetWindowPos(scrcpy,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_SHOWWINDOW);
@@ -960,13 +1019,7 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
         break;
     case WM_MOVE:
         if(docked_scrcpy_window&&IsWindow(docked_scrcpy_window)&&!IsIconic(hwnd)){
-            RECT gui_visible,scrcpy_rect,scrcpy_visible;int x,visible_width;
-            get_visible_window_rect(hwnd,&gui_visible);GetWindowRect(docked_scrcpy_window,&scrcpy_rect);
-            get_visible_window_rect(docked_scrcpy_window,&scrcpy_visible);
-            visible_width=scrcpy_visible.right-scrcpy_visible.left;
-            x=dock_side>0?gui_visible.right-(scrcpy_visible.left-scrcpy_rect.left):
-                           gui_visible.left-visible_width-(scrcpy_visible.left-scrcpy_rect.left);
-            SetWindowPos(docked_scrcpy_window,NULL,x,scrcpy_rect.top,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);
+            position_scrcpy_window(hwnd,docked_scrcpy_window,NULL,SWP_NOZORDER|SWP_NOACTIVATE);
         }
         return 0;
     case WM_COMMAND:
@@ -1020,11 +1073,12 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
         } else if (LOWORD(wparam)==IDC_QUALITY && HIWORD(wparam)==CBN_SELCHANGE) {
             int selected=(int)SendMessageW(quality_combo,CB_GETCURSEL,0,0);
             const wchar_t *names[]={L"自动",L"流畅",L"均衡",L"高清",L"极致"};
-            wchar_t message[120];
+            wchar_t log_message[120];
             if(selected<QUALITY_AUTO||selected>QUALITY_ULTRA) selected=QUALITY_AUTO;
             InterlockedExchange(&quality_mode,selected);
-            _snwprintf(message,ARRAYSIZE(message)-1,L"画质已切换为“%ls”，正在重启 scrcpy。",names[selected]);
-            post_log(message);terminate_scrcpy();
+            _snwprintf(log_message,ARRAYSIZE(log_message)-1,L"画质已切换为“%ls”，正在重启 scrcpy。",names[selected]);
+            log_message[ARRAYSIZE(log_message)-1]=0;
+            post_log(log_message);terminate_scrcpy();
         } return 0;
     case WM_DRAWITEM:
         if(((const DRAWITEMSTRUCT*)lparam)->CtlID==IDC_QUALITY)draw_quality_item((const DRAWITEMSTRUCT*)lparam);
@@ -1095,7 +1149,8 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
         InterlockedExchange(&screen_is_off,(LONG)wparam);
         refresh_status_text();layout(hwnd);InvalidateRect(hwnd,NULL,TRUE);return 0;
     case WM_CLOSE:
-        KillTimer(hwnd,DOCK_TIMER_ID);EnableWindow(hwnd,FALSE);SetEvent(stop_event);terminate_scrcpy();
+        KillTimer(hwnd,DOCK_TIMER_ID);
+        EnableWindow(hwnd,FALSE);SetEvent(stop_event);terminate_scrcpy();
         if(worker_handle)WaitForSingleObject(worker_handle,3000);
         if(screen_worker_handle)WaitForSingleObject(screen_worker_handle,3000);
         DestroyWindow(hwnd);return 0;
@@ -1111,15 +1166,15 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
 int WINAPI wWinMain(HINSTANCE instance,HINSTANCE previous,LPWSTR command_line,int show) {
     WNDCLASSEXW wc;WNDCLASSW scroll_class;MSG message;HWND existing;
     (void)previous;(void)command_line;app_instance=instance;
+    {
+        HMODULE user32=GetModuleHandleW(L"user32.dll");
+        typedef BOOL (WINAPI *SetProcessDpiAwarenessContextFn)(HANDLE);
+        union { FARPROC raw; SetProcessDpiAwarenessContextFn call; } set_process_dpi_context;
+        set_process_dpi_context.raw=user32?GetProcAddress(user32,"SetProcessDpiAwarenessContext"):NULL;
+        if(set_process_dpi_context.call)set_process_dpi_context.call((HANDLE)(LONG_PTR)-5);
+    }
     mutex_handle=CreateMutexW(NULL,TRUE,APP_MUTEX);if(!mutex_handle)return 1;
     if(GetLastError()==ERROR_ALREADY_EXISTS){existing=FindWindowW(L"MUScrcpyGuiWindow",APP_TITLE);if(existing){if(IsIconic(existing))ShowWindow(existing,SW_RESTORE);SetForegroundWindow(existing);}CloseHandle(mutex_handle);return 0;}
-    {
-        HMODULE user32 = GetModuleHandleW(L"user32.dll");
-        typedef BOOL (WINAPI *SetDpiAwareFn)(void);
-        union { FARPROC raw; SetDpiAwareFn call; } set_dpi_aware;
-        set_dpi_aware.raw = user32 ? GetProcAddress(user32, "SetProcessDPIAware") : NULL;
-        if (set_dpi_aware.call) set_dpi_aware.call();
-    }
     load_preferences();
     InitializeCriticalSection(&process_lock);stop_event=CreateEventW(NULL,TRUE,FALSE,NULL);InitCommonControls();
     if(initialize_bin_directory())detect_scrcpy_version();
