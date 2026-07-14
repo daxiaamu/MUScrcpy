@@ -6,7 +6,7 @@
 BEGIN
   "<?xml version='1.0' encoding='UTF-8' standalone='yes'?>\r\n"
   "<assembly xmlns='urn:schemas-microsoft-com:asm.v1' manifestVersion='1.0'>\r\n"
-  " <assemblyIdentity version='2.3.0.0' processorArchitecture='*' name='daxiaamu.MUScrcpy' type='win32'/>\r\n"
+  " <assemblyIdentity version='2.3.1.0' processorArchitecture='*' name='daxiaamu.MUScrcpy' type='win32'/>\r\n"
   " <description>MU Screen Casting</description>\r\n"
   " <dependency><dependentAssembly><assemblyIdentity type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'/></dependentAssembly></dependency>\r\n"
   " <trustInfo xmlns='urn:schemas-microsoft-com:asm.v3'><security><requestedPrivileges><requestedExecutionLevel level='asInvoker' uiAccess='false'/></requestedPrivileges></security></trustInfo>\r\n"
@@ -27,12 +27,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "大侠阿木\0"
             VALUE "FileDescription", "MU投屏\0"
-            VALUE "FileVersion", "2.3.0.0\0"
+            VALUE "FileVersion", "2.3.1.0\0"
             VALUE "InternalName", "MUScrcpy\0"
             VALUE "LegalCopyright", "daxiaamu.com\0"
             VALUE "OriginalFilename", "MUScrcpy.exe\0"
             VALUE "ProductName", "MU投屏\0"
-            VALUE "ProductVersion", "2.3.0.0\0"
+            VALUE "ProductVersion", "2.3.1.0\0"
         END
     END
     BLOCK "VarFileInfo"

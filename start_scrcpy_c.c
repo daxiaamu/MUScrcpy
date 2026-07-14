@@ -5,7 +5,7 @@
 #include <stdio.h>
 #include <wchar.h>
 
-#define APP_VERSION L"2.3"
+#define APP_VERSION L"2.3.1"
 #define APP_TITLE L"MU投屏 " APP_VERSION L" daxiaamu.com"
 #define APP_MUTEX L"Daxiaamu.MUScrcpy.GUI.SingleInstance"
 #define WM_APP_LOG (WM_APP + 1)
@@ -432,7 +432,411 @@ static void launch_scrcpy(void) {
     _snwprintf(exe, ARRAYSIZE(exe)-1, L"%ls\\scrcpy.exe", bin_dir);
     _snwprintf(command, ARRAYSIZE(command)-1, L"\"%ls\"", exe);
     command[ARRAYSIZE(command)-1] = 0;
-    if (compatible) wcscat(command,L" …5994 tokens truncated…PtrW(hwnd,GWLP_USERDATA);
+    if (compatible) wcscat(command,L" -d --render-driver=software --no-audio");
+    if (stay_awake) wcscat(command,L" --stay-awake");
+    if (always_on_top) wcscat(command,L" --always-on-top");
+    append_quality_options(command,effective_quality);
+    ZeroMemory(&si, sizeof(si)); ZeroMemory(&pi, sizeof(pi)); si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES; si.wShowWindow = SW_HIDE;
+    si.hStdOutput = write_pipe; si.hStdError = write_pipe; si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    if(selected_quality==QUALITY_AUTO) {
+        if(effective_quality==QUALITY_SMOOTH) post_log(L"自动画质已选择：流畅。");
+        else if(effective_quality==QUALITY_HIGH) post_log(L"自动画质已选择：高清。");
+        else post_log(L"自动画质已选择：均衡。");
+    }
+    if (compatible && stay_awake) post_log(L"正在以兼容模式启动 scrcpy（保持亮屏）…");
+    else if (compatible) post_log(L"正在以兼容模式启动 scrcpy…");
+    else if (stay_awake) post_log(L"正在启动 scrcpy（保持亮屏）…");
+    else post_log(L"正在无参数启动 scrcpy…");
+    if (!CreateProcessW(NULL, command, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, bin_dir, &si, &pi)) {
+        post_log(L"scrcpy.exe 启动失败，请检查 bin 目录。"); CloseHandle(read_pipe); CloseHandle(write_pipe); Sleep(1000); return;
+    }
+    CloseHandle(write_pipe);
+    EnterCriticalSection(&process_lock); scrcpy_process = pi.hProcess; scrcpy_process_id=pi.dwProcessId; LeaveCriticalSection(&process_lock);
+    PostMessageW(main_window,WM_APP_DOCK_SCRCPY,0,0);
+    post_status(compatible ? L"兼容模式投屏中" : L"正在投屏");
+    forward_scrcpy_output(pi.hProcess, read_pipe);
+    WaitForSingleObject(pi.hProcess, 1000);
+    EnterCriticalSection(&process_lock); scrcpy_process = NULL; scrcpy_process_id=0; LeaveCriticalSection(&process_lock);
+    docked_scrcpy_window=NULL;
+    CloseHandle(read_pipe); CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    if (WaitForSingleObject(stop_event, 0) != WAIT_OBJECT_0) post_log(L"scrcpy 已退出，准备重新连接。");
+}
+
+static DWORD WINAPI launcher_worker(LPVOID ignored) {
+    BOOL waiting_logged = FALSE, info_requested = FALSE;
+    (void)ignored;
+    if (!initialize_bin_directory()) {
+        post_status(L"缺少运行文件"); post_log(L"未找到 bin\\adb.exe 或 bin\\scrcpy.exe。"); return 1;
+    }
+    while (WaitForSingleObject(stop_event, 0) != WAIT_OBJECT_0) {
+        if (!device_is_online()) {
+            info_requested=FALSE;
+            if (!waiting_logged) { post_status(L"等待设备连接"); post_log(L"等待 USB 设备，请确认已开启 USB 调试。"); waiting_logged = TRUE; }
+            WaitForSingleObject(stop_event, 1000); continue;
+        }
+        waiting_logged = FALSE;
+        if(!info_requested){
+            HANDLE info_thread=CreateThread(NULL,0,device_info_worker,NULL,0,NULL);
+            if(info_thread){CloseHandle(info_thread);info_requested=TRUE;}
+        }
+        post_log(L"设备已连接，正在并行启动投屏并读取设备信息。");launch_scrcpy();
+        if (WaitForSingleObject(stop_event, 0) != WAIT_OBJECT_0) WaitForSingleObject(stop_event, 350);
+    }
+    return 0;
+}
+
+static DWORD WINAPI wake_worker(LPVOID ignored) {
+    wchar_t output[256];
+    (void)ignored; post_log(L"正在发送点亮屏幕指令…");
+    if (run_adb(L"-d shell input keyevent 224", output, ARRAYSIZE(output), 5000)) post_log(L"点亮屏幕指令已发送。");
+    else post_log(L"点亮失败，请检查设备连接和 USB 调试授权。");
+    return 0;
+}
+
+static DWORD WINAPI screen_monitor_worker(LPVOID ignored) {
+    LONG previous = -1;
+    (void)ignored;
+    while (WaitForSingleObject(stop_event, 0) != WAIT_OBJECT_0) {
+        wchar_t state[512];
+        LONG off = 0;
+        if (bin_dir[0] && run_adb(L"-d shell \"dumpsys power | grep -E 'mWakefulness=|Display Power: state=|mScreenOn='\"",
+                                  state, ARRAYSIZE(state), 4000)) {
+            if (wcsstr(state,L"mWakefulness=Asleep") || wcsstr(state,L"mWakefulness=Dozing") ||
+                wcsstr(state,L"state=OFF") || wcsstr(state,L"mScreenOn=false")) off = 1;
+            else if (wcsstr(state,L"mWakefulness=Awake") || wcsstr(state,L"state=ON") ||
+                     wcsstr(state,L"mScreenOn=true")) off = 0;
+        }
+        if (off != previous) {
+            previous = off;
+            PostMessageW(main_window,WM_APP_SCREEN,(WPARAM)off,0);
+        }
+        WaitForSingleObject(stop_event,500);
+    }
+    return 0;
+}
+
+static HWND create_text(HWND parent, const wchar_t *text) {
+    HWND h = CreateWindowExW(0, L"STATIC", text, WS_CHILD|WS_VISIBLE|SS_LEFT|SS_NOPREFIX,
+                             0,0,0,0,parent,NULL,app_instance,NULL);
+    SendMessageW(h, WM_SETFONT, (WPARAM)font_normal, TRUE); return h;
+}
+
+static LRESULT CALLBACK modern_button_proc(HWND hwnd,UINT message,WPARAM wparam,LPARAM lparam){
+    switch(message){
+    case WM_MOUSEMOVE:
+        if(hot_button!=hwnd){
+            TRACKMOUSEEVENT tracking;HWND old=hot_button;hot_button=hwnd;
+            if(old)InvalidateRect(old,NULL,TRUE);
+            InvalidateRect(hwnd,NULL,TRUE);
+            ZeroMemory(&tracking,sizeof(tracking));tracking.cbSize=sizeof(tracking);
+            tracking.dwFlags=TME_LEAVE;tracking.hwndTrack=hwnd;TrackMouseEvent(&tracking);
+        }
+        break;
+    case WM_MOUSELEAVE:
+        if(hot_button==hwnd){hot_button=NULL;InvalidateRect(hwnd,NULL,TRUE);}
+        break;
+    case WM_ENABLE:InvalidateRect(hwnd,NULL,TRUE);break;
+    }
+    return CallWindowProcW(button_window_proc,hwnd,message,wparam,lparam);
+}
+
+static void style_modern_button(HWND button){
+    WNDPROC proc=(WNDPROC)SetWindowLongPtrW(button,GWLP_WNDPROC,(LONG_PTR)modern_button_proc);
+    if(!button_window_proc)button_window_proc=proc;
+}
+
+static HWND create_button(HWND parent, const wchar_t *text, int id) {
+    HWND h = CreateWindowExW(0, L"BUTTON", text, WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,
+                             0,0,0,0,parent,(HMENU)(INT_PTR)id,app_instance,NULL);
+    SendMessageW(h, WM_SETFONT, (WPARAM)font_normal, TRUE);style_modern_button(h);return h;
+}
+
+static HWND create_checkbox(HWND parent, const wchar_t *text, int id) {
+    HWND h = CreateWindowExW(0, L"BUTTON", text, WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,
+                             0,0,0,0,parent,(HMENU)(INT_PTR)id,app_instance,NULL);
+    SendMessageW(h, WM_SETFONT, (WPARAM)font_normal, TRUE);style_modern_button(h);
+    return h;
+}
+
+static LRESULT CALLBACK quality_list_proc(HWND hwnd,UINT message,WPARAM wparam,LPARAM lparam,
+                                          UINT_PTR subclass_id,DWORD_PTR data){
+    LRESULT result=DefSubclassProc(hwnd,message,wparam,lparam);(void)subclass_id;(void)data;
+    if(message==WM_NCPAINT||message==WM_SHOWWINDOW){
+        HDC dc=GetWindowDC(hwnd);RECT r;HPEN pen;HGDIOBJ old_pen,old_brush;
+        if(dc){
+            GetWindowRect(hwnd,&r);OffsetRect(&r,-r.left,-r.top);
+            pen=CreatePen(PS_SOLID,1,CLR_ACCENT);old_pen=SelectObject(dc,pen);
+            old_brush=SelectObject(dc,GetStockObject(NULL_BRUSH));Rectangle(dc,0,0,r.right,r.bottom);
+            SelectObject(dc,old_brush);SelectObject(dc,old_pen);DeleteObject(pen);ReleaseDC(hwnd,dc);
+        }
+    }
+    return result;
+}
+
+static LRESULT CALLBACK quality_combo_proc(HWND hwnd,UINT message,WPARAM wparam,LPARAM lparam,
+                                           UINT_PTR subclass_id,DWORD_PTR data){
+    (void)subclass_id;(void)data;
+    switch(message){
+    case WM_MOUSEMOVE:
+        if(!quality_combo_hover){
+            TRACKMOUSEEVENT tracking;quality_combo_hover=TRUE;InvalidateRect(hwnd,NULL,TRUE);
+            ZeroMemory(&tracking,sizeof(tracking));tracking.cbSize=sizeof(tracking);
+            tracking.dwFlags=TME_LEAVE;tracking.hwndTrack=hwnd;TrackMouseEvent(&tracking);
+        }
+        break;
+    case WM_MOUSELEAVE:quality_combo_hover=FALSE;InvalidateRect(hwnd,NULL,TRUE);break;
+    case WM_SETFOCUS:case WM_KILLFOCUS:case WM_ENABLE:InvalidateRect(hwnd,NULL,TRUE);break;
+    case WM_PAINT:{
+        PAINTSTRUCT ps;HDC dc=BeginPaint(hwnd,&ps);RECT r,text_rect;wchar_t text[40]=L"";
+        BOOL focused=GetFocus()==hwnd,dropped=(BOOL)SendMessageW(hwnd,CB_GETDROPPEDSTATE,0,0);
+        COLORREF border=(focused||dropped)?CLR_ACCENT:(quality_combo_hover?RGB(174,185,199):CLR_BORDER);
+        HBRUSH brush;HPEN pen=CreatePen(PS_SOLID,1,border);
+        HGDIOBJ old_brush,old_pen=SelectObject(dc,pen);int selected;
+        GetClientRect(hwnd,&r);brush=CreateSolidBrush(CLR_BG);FillRect(dc,&r,brush);DeleteObject(brush);
+        brush=CreateSolidBrush(CLR_CARD);old_brush=SelectObject(dc,brush);RoundRect(dc,r.left,r.top,r.right,r.bottom,6,6);
+        SelectObject(dc,old_pen);SelectObject(dc,old_brush);DeleteObject(pen);DeleteObject(brush);
+        selected=(int)SendMessageW(hwnd,CB_GETCURSEL,0,0);
+        if(selected!=CB_ERR)SendMessageW(hwnd,CB_GETLBTEXT,selected,(LPARAM)text);
+        text_rect=r;text_rect.left+=8;text_rect.right-=27;SetBkMode(dc,TRANSPARENT);SetTextColor(dc,CLR_TEXT);
+        SelectObject(dc,font_normal);DrawTextW(dc,text,-1,&text_rect,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX|DT_END_ELLIPSIS);
+        pen=CreatePen(PS_SOLID,1,CLR_MUTED);old_pen=SelectObject(dc,pen);
+        MoveToEx(dc,r.right-18,r.top+(r.bottom-r.top)/2-2,NULL);
+        LineTo(dc,r.right-14,r.top+(r.bottom-r.top)/2+2);LineTo(dc,r.right-10,r.top+(r.bottom-r.top)/2-2);
+        SelectObject(dc,old_pen);DeleteObject(pen);EndPaint(hwnd,&ps);return 0;
+    }
+    }
+    return DefSubclassProc(hwnd,message,wparam,lparam);
+}
+
+static void layout(HWND hwnd) {
+    RECT r; int width, card_width, half, y, log_height;
+    BOOL show_wake = InterlockedCompareExchange(&screen_is_off,0,0) != 0;
+    GetClientRect(hwnd, &r); width = r.right; card_width = width - 56; half = (card_width-24)/2;
+    MoveWindow(status_view,28,24,width-330,24,TRUE);
+    MoveWindow(quality_label,width-248,19,38,28,TRUE);
+    MoveWindow(quality_combo,width-204,19,90,180,TRUE);
+    MoveWindow(quality_help,width-104,19,76,28,TRUE);
+    y=76;
+    MoveWindow(model_view,44,y,half-16,48,TRUE); MoveWindow(serial_view,52+half,y,half-16,48,TRUE); y+=55;
+    MoveWindow(android_view,44,y,half-16,48,TRUE); MoveWindow(slot_view,52+half,y,half-16,48,TRUE); y+=55;
+    MoveWindow(system_view,44,y,card_width-32,48,TRUE); y+=55;
+    MoveWindow(kernel_view,44,y-3,card_width-32,54,TRUE);
+    ShowWindow(wake_button,SW_SHOW);
+    EnableWindow(wake_button,show_wake);
+    MoveWindow(wake_button,28,307,130,42,TRUE);
+    MoveWindow(stay_awake_check,width-362,307,110,42,TRUE);
+    MoveWindow(compat_check,width-244,307,104,42,TRUE);
+    MoveWindow(always_on_top_check,width-132,307,104,42,TRUE);
+    log_height=r.bottom-389;
+    MoveWindow(log_view,28,365,card_width-16,log_height,TRUE);
+    MoveWindow(log_scroll,28+card_width-16,365,16,log_height,TRUE);
+}
+
+static BOOL get_log_thumb_rect(HWND scrollbar, RECT *thumb, int *visible_lines, int *total_lines) {
+    RECT client,log_client;
+    HDC dc;TEXTMETRICW metrics;
+    int first,visible,total,height,thumb_height,top;
+    GetClientRect(scrollbar,&client);GetClientRect(log_view,&log_client);
+    dc=GetDC(log_view);SelectObject(dc,font_log);GetTextMetricsW(dc,&metrics);ReleaseDC(log_view,dc);
+    visible=metrics.tmHeight?log_client.bottom/metrics.tmHeight:1;if(visible<1)visible=1;
+    total=(int)SendMessageW(log_view,EM_GETLINECOUNT,0,0);if(total<1)total=1;
+    if(visible_lines)*visible_lines=visible;
+    if(total_lines)*total_lines=total;
+    if(total<=visible)return FALSE;
+    first=(int)SendMessageW(log_view,EM_GETFIRSTVISIBLELINE,0,0);
+    height=client.bottom-client.top-32;if(height<=0)return FALSE;
+    thumb_height=height*visible/total;
+    if(thumb_height<28)thumb_height=28;
+    if(thumb_height>height)thumb_height=height;
+    top=16+(height-thumb_height)*first/(total-visible);
+    SetRect(thumb,0,top,client.right,top+thumb_height);return TRUE;
+}
+
+static void scroll_log_from_thumb(HWND scrollbar, int mouse_y) {
+    RECT client,thumb;int visible,total,track,desired,first;
+    GetClientRect(scrollbar,&client);
+    if(!get_log_thumb_rect(scrollbar,&thumb,&visible,&total))return;
+    track=client.bottom-32-(thumb.bottom-thumb.top);if(track<=0)return;
+    desired=mouse_y-scroll_drag_offset-16;if(desired<0)desired=0;if(desired>track)desired=track;
+    desired=desired*(total-visible)/track;
+    first=(int)SendMessageW(log_view,EM_GETFIRSTVISIBLELINE,0,0);
+    SendMessageW(log_view,EM_LINESCROLL,0,desired-first);InvalidateRect(scrollbar,NULL,TRUE);
+}
+
+static LRESULT CALLBACK log_scroll_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+    switch(message){
+    case WM_ERASEBKGND:return 1;
+    case WM_PAINT:{
+        PAINTSTRUCT ps;HDC dc=BeginPaint(hwnd,&ps);RECT client,thumb;HBRUSH brush;
+        GetClientRect(hwnd,&client);brush=CreateSolidBrush(CLR_LOG_BG);FillRect(dc,&client,brush);DeleteObject(brush);
+        if(get_log_thumb_rect(hwnd,&thumb,NULL,NULL)){
+            HGDIOBJ old_brush,old_pen;POINT up[3]={{4,10},{8,5},{12,10}};POINT down[3];
+            int inset=2;
+            down[0].x=4;down[0].y=client.bottom-10;down[1].x=12;down[1].y=client.bottom-10;down[2].x=8;down[2].y=client.bottom-5;
+            brush=CreateSolidBrush(RGB(151,160,174));old_brush=SelectObject(dc,brush);old_pen=SelectObject(dc,GetStockObject(NULL_PEN));
+            Polygon(dc,up,3);Polygon(dc,down,3);SelectObject(dc,old_pen);SelectObject(dc,old_brush);DeleteObject(brush);
+            thumb.left+=inset;thumb.right-=inset;
+            brush=CreateSolidBrush(scroll_hover||GetCapture()==hwnd?RGB(220,224,230):RGB(188,194,203));old_brush=SelectObject(dc,brush);old_pen=SelectObject(dc,GetStockObject(NULL_PEN));
+            RoundRect(dc,thumb.left,thumb.top,thumb.right,thumb.bottom,12,12);
+            SelectObject(dc,old_pen);SelectObject(dc,old_brush);DeleteObject(brush);
+        }
+        EndPaint(hwnd,&ps);return 0;
+    }
+    case WM_LBUTTONDOWN:{
+        RECT thumb,client;int y=(short)HIWORD(lparam);
+        if(!get_log_thumb_rect(hwnd,&thumb,NULL,NULL))return 0;
+        GetClientRect(hwnd,&client);
+        if(y<16){SendMessageW(log_view,EM_LINESCROLL,0,-3);InvalidateRect(hwnd,NULL,TRUE);return 0;}
+        if(y>=client.bottom-16){SendMessageW(log_view,EM_LINESCROLL,0,3);InvalidateRect(hwnd,NULL,TRUE);return 0;}
+        if(y>=thumb.top&&y<=thumb.bottom)scroll_drag_offset=y-thumb.top;
+        else{scroll_drag_offset=(thumb.bottom-thumb.top)/2;scroll_log_from_thumb(hwnd,y);}
+        SetCapture(hwnd);return 0;
+    }
+    case WM_MOUSEMOVE:
+        if(!scroll_hover){TRACKMOUSEEVENT tracking;ZeroMemory(&tracking,sizeof(tracking));tracking.cbSize=sizeof(tracking);tracking.dwFlags=TME_LEAVE;tracking.hwndTrack=hwnd;TrackMouseEvent(&tracking);scroll_hover=TRUE;InvalidateRect(hwnd,NULL,TRUE);}
+        if(GetCapture()==hwnd&&(wparam&MK_LBUTTON)){scroll_log_from_thumb(hwnd,(short)HIWORD(lparam));return 0;}
+        break;
+    case WM_MOUSELEAVE:scroll_hover=FALSE;InvalidateRect(hwnd,NULL,TRUE);return 0;
+    case WM_LBUTTONUP:if(GetCapture()==hwnd)ReleaseCapture();scroll_drag_offset=-1;return 0;
+    case WM_MOUSEWHEEL:SendMessageW(log_view,WM_MOUSEWHEEL,wparam,lparam);InvalidateRect(hwnd,NULL,TRUE);return 0;
+    }
+    return DefWindowProcW(hwnd,message,wparam,lparam);
+}
+
+static LRESULT CALLBACK log_edit_subclass(HWND hwnd,UINT message,WPARAM wparam,LPARAM lparam,UINT_PTR id,DWORD_PTR data){
+    LRESULT result=DefSubclassProc(hwnd,message,wparam,lparam);(void)id;(void)data;
+    if(message==WM_MOUSEWHEEL||message==WM_KEYDOWN||message==WM_VSCROLL)InvalidateRect(log_scroll,NULL,TRUE);
+    return result;
+}
+
+static void draw_quality_item(const DRAWITEMSTRUCT *item) {
+    wchar_t text[40]=L"";RECT r=item->rcItem;BOOL selected=(item->itemState&ODS_SELECTED)!=0;
+    HBRUSH brush=CreateSolidBrush(selected?CLR_ACCENT:CLR_CARD);
+    FillRect(item->hDC,&r,brush);DeleteObject(brush);
+    if(item->itemID!=(UINT)-1)SendMessageW(item->hwndItem,CB_GETLBTEXT,item->itemID,(LPARAM)text);
+    else GetWindowTextW(item->hwndItem,text,ARRAYSIZE(text));
+    SetBkMode(item->hDC,TRANSPARENT);SetTextColor(item->hDC,selected?RGB(255,255,255):CLR_TEXT);SelectObject(item->hDC,font_normal);
+    r.left+=10;DrawTextW(item->hDC,text,-1,&r,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
+}
+
+static BOOL option_is_checked(UINT id){
+    if(id==IDC_STAY_AWAKE)return InterlockedCompareExchange(&stay_awake_mode,0,0)!=0;
+    if(id==IDC_COMPAT)return InterlockedCompareExchange(&compat_mode,0,0)!=0;
+    if(id==IDC_ALWAYS_ON_TOP)return InterlockedCompareExchange(&always_on_top_mode,0,0)!=0;
+    return FALSE;
+}
+
+static void draw_option_checkbox(const DRAWITEMSTRUCT *item){
+    RECT r=item->rcItem,box,text_rect;BOOL checked=option_is_checked(item->CtlID);
+    BOOL disabled=(item->itemState&ODS_DISABLED)!=0,hot=item->hwndItem==hot_button;
+    COLORREF border=disabled?RGB(205,210,217):(hot?RGB(142,155,171):CLR_BORDER);
+    COLORREF fill=checked?(disabled?RGB(156,162,170):CLR_ACCENT):CLR_BG;
+    COLORREF text_color=disabled?RGB(156,162,170):(hot?CLR_TEXT:CLR_MUTED);
+    HBRUSH brush;HPEN pen;FillRect(item->hDC,&r,brush_bg);
+    brush=CreateSolidBrush(fill);pen=CreatePen(PS_SOLID,1,checked?fill:border);
+    HGDIOBJ old_brush=SelectObject(item->hDC,brush),old_pen=SelectObject(item->hDC,pen);
+    int side=16,left=r.left+1,top=r.top+(r.bottom-r.top-side)/2;
+    SetRect(&box,left,top,left+side,top+side);RoundRect(item->hDC,box.left,box.top,box.right,box.bottom,4,4);
+    if(checked){
+        HPEN check_pen=CreatePen(PS_SOLID,2,RGB(255,255,255));SelectObject(item->hDC,check_pen);
+        MoveToEx(item->hDC,box.left+4,box.top+8,NULL);LineTo(item->hDC,box.left+7,box.top+11);LineTo(item->hDC,box.left+13,box.top+5);
+        SelectObject(item->hDC,pen);DeleteObject(check_pen);
+    }
+    SelectObject(item->hDC,old_pen);SelectObject(item->hDC,old_brush);DeleteObject(pen);DeleteObject(brush);
+    text_rect=r;text_rect.left=box.right+7;SetBkMode(item->hDC,TRANSPARENT);SetTextColor(item->hDC,text_color);
+    SelectObject(item->hDC,font_normal);
+    {
+        wchar_t text[40];GetWindowTextW(item->hwndItem,text,ARRAYSIZE(text));
+        DrawTextW(item->hDC,text,-1,&text_rect,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
+    }
+    if(item->itemState&ODS_FOCUS){RECT focus=text_rect;InflateRect(&focus,-1,-7);DrawFocusRect(item->hDC,&focus);}
+}
+
+static void draw_owner_button(const DRAWITEMSTRUCT *item) {
+    BOOL pressed = (item->itemState & ODS_SELECTED) != 0;
+    BOOL disabled = (item->itemState & ODS_DISABLED) != 0;
+    BOOL hot=item->hwndItem==hot_button;
+    COLORREF color = disabled ? RGB(203,211,222) : (pressed ? CLR_ACCENT_PRESSED : (hot?CLR_ACCENT_HOT:CLR_ACCENT));
+    COLORREF text_color=disabled?RGB(75,85,99):RGB(255,255,255);
+    HBRUSH brush;HPEN pen;HGDIOBJ old_brush,old_pen;RECT r=item->rcItem; wchar_t text[80];
+    if(item->CtlID==IDC_QUALITY_HELP){
+        COLORREF fill=pressed?RGB(224,228,234):(hot?RGB(235,238,243):CLR_BG);
+        FillRect(item->hDC,&r,brush_bg);
+        brush=CreateSolidBrush(fill);pen=CreatePen(PS_SOLID,1,fill);
+        old_brush=SelectObject(item->hDC,brush);old_pen=SelectObject(item->hDC,pen);
+        RoundRect(item->hDC,r.left,r.top,r.right,r.bottom,6,6);
+        SelectObject(item->hDC,old_pen);SelectObject(item->hDC,old_brush);DeleteObject(pen);DeleteObject(brush);
+        SetBkMode(item->hDC,TRANSPARENT);SetTextColor(item->hDC,CLR_MUTED);SelectObject(item->hDC,font_normal);
+        DrawTextW(item->hDC,L"帮助  ▾",-1,&r,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
+        if(item->itemState&ODS_FOCUS){InflateRect(&r,-4,-4);DrawFocusRect(item->hDC,&r);}return;
+    }
+    {
+        FillRect(item->hDC,&r,brush_bg);
+        brush=CreateSolidBrush(color);pen=CreatePen(PS_SOLID,1,color);old_brush=SelectObject(item->hDC,brush);old_pen=SelectObject(item->hDC,pen);
+        RoundRect(item->hDC,r.left,r.top,r.right,r.bottom,6,6);
+        SelectObject(item->hDC,old_pen);SelectObject(item->hDC,old_brush);DeleteObject(pen);DeleteObject(brush);
+    }
+    SetBkMode(item->hDC,TRANSPARENT); SetTextColor(item->hDC,text_color); SelectObject(item->hDC,font_normal);
+    GetWindowTextW(item->hwndItem,text,ARRAYSIZE(text)); DrawTextW(item->hDC,text,-1,&r,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    if(item->itemState&ODS_FOCUS){InflateRect(&r,-4,-4);DrawFocusRect(item->hDC,&r);}
+}
+
+static void open_update_page(HWND owner){
+    if((INT_PTR)ShellExecuteW(owner,L"open",L"https://optool.daxiaamu.com/muscrcpy",NULL,NULL,SW_SHOWNORMAL)<=32)
+        MessageBoxW(owner,L"无法打开更新页面。",L"打开失败",MB_OK|MB_ICONERROR);
+}
+
+static LRESULT CALLBACK about_static_proc(HWND hwnd,UINT message,WPARAM wparam,LPARAM lparam,
+                                          UINT_PTR subclass_id,DWORD_PTR data){
+    (void)wparam;(void)lparam;(void)subclass_id;(void)data;
+    if(message==WM_LBUTTONDOWN||message==WM_RBUTTONDOWN||message==WM_MBUTTONDOWN){
+        DestroyWindow(GetParent(hwnd));return 0;
+    }
+    return DefSubclassProc(hwnd,message,wparam,lparam);
+}
+
+static LRESULT CALLBACK about_proc(HWND hwnd,UINT message,WPARAM wparam,LPARAM lparam){
+    HWND owner;
+    switch(message){
+    case WM_NCCREATE:
+        SetWindowLongPtrW(hwnd,GWLP_USERDATA,(LONG_PTR)((CREATESTRUCTW*)lparam)->lpCreateParams);return TRUE;
+    case WM_CREATE:{
+        RECT client;int width,title_width=290,info_width=290,link_width=112,logo_size=64;HICON icon;
+        HWND logo,title,info,scrcpy_info,link;wchar_t scrcpy_text[120];GetClientRect(hwnd,&client);width=client.right-client.left;
+        logo=CreateWindowW(L"STATIC",NULL,WS_CHILD|WS_VISIBLE|SS_ICON|SS_CENTERIMAGE,
+                           (width-logo_size)/2,30,logo_size,logo_size,hwnd,(HMENU)IDC_ABOUT_LOGO,app_instance,NULL);
+        icon=(HICON)LoadImageW(app_instance,MAKEINTRESOURCEW(1),IMAGE_ICON,logo_size,logo_size,LR_DEFAULTCOLOR|LR_SHARED);
+        if(icon)SendMessageW(logo,STM_SETICON,(WPARAM)icon,0);
+        title=CreateWindowW(L"STATIC",L"MU投屏",WS_CHILD|WS_VISIBLE|SS_CENTER,
+                            (width-title_width)/2,119,title_width,38,hwnd,(HMENU)IDC_ABOUT_TITLE,app_instance,NULL);
+        info=CreateWindowW(L"STATIC",L"v" APP_VERSION L"  ·  大侠阿木",WS_CHILD|WS_VISIBLE|SS_CENTER,
+                           (width-info_width)/2,166,info_width,24,hwnd,(HMENU)IDC_ABOUT_INFO,app_instance,NULL);
+        _snwprintf(scrcpy_text,ARRAYSIZE(scrcpy_text)-1,L"当前 scrcpy 版本：%ls",scrcpy_version);
+        scrcpy_text[ARRAYSIZE(scrcpy_text)-1]=0;
+        scrcpy_info=CreateWindowW(L"STATIC",scrcpy_text,WS_CHILD|WS_VISIBLE|SS_CENTER,
+                                  (width-info_width)/2,193,info_width,24,hwnd,(HMENU)IDC_ABOUT_SCRCPY,app_instance,NULL);
+        link=create_button(hwnd,L"检查更新",IDC_ABOUT_UPDATE);
+        MoveWindow(link,(width-link_width)/2,233,link_width,36,TRUE);
+        SendMessageW(title,WM_SETFONT,(WPARAM)(font_about_title?font_about_title:font_bold),TRUE);
+        SendMessageW(info,WM_SETFONT,(WPARAM)font_normal,TRUE);
+        SendMessageW(scrcpy_info,WM_SETFONT,(WPARAM)font_normal,TRUE);
+        SetWindowSubclass(logo,about_static_proc,1,0);SetWindowSubclass(title,about_static_proc,1,0);
+        SetWindowSubclass(info,about_static_proc,1,0);SetWindowSubclass(scrcpy_info,about_static_proc,1,0);return 0;
+    }
+    case WM_ERASEBKGND:return 1;
+    case WM_PAINT:{
+        PAINTSTRUCT ps;RECT client;HDC dc=BeginPaint(hwnd,&ps);GetClientRect(hwnd,&client);
+        FillRect(dc,&client,brush_bg);EndPaint(hwnd,&ps);return 0;
+    }
+    case WM_COMMAND:
+        if(LOWORD(wparam)==IDC_ABOUT_UPDATE){open_update_page(hwnd);return 0;}
+        if(LOWORD(wparam)==IDCANCEL){DestroyWindow(hwnd);return 0;}break;
+    case WM_LBUTTONDOWN:case WM_RBUTTONDOWN:case WM_MBUTTONDOWN:
+        DestroyWindow(hwnd);return 0;
+    case WM_ACTIVATE:
+        if(LOWORD(wparam)==WA_INACTIVE){
+            HWND next=(HWND)lparam,owner_window=(HWND)GetWindowLongPtrW(hwnd,GWLP_USERDATA);
             if(next!=owner_window&&!IsChild(hwnd,next))DestroyWindow(hwnd);
         }
         return 0;
@@ -476,10 +880,13 @@ static void show_about_window(HWND owner){
 
 static void refresh_status_text(void){
     wchar_t line[280];
-    if(InterlockedCompareExchange(&screen_is_off,0,0))
+    BOOL projecting=!wcscmp(current_status,L"正在投屏")||!wcscmp(current_status,L"兼容模式投屏中");
+    if(projecting&&InterlockedCompareExchange(&screen_is_off,0,0))
         _snwprintf(line,ARRAYSIZE(line)-1,L"●  %ls  ·  手机屏幕已熄灭",current_status);
-    else
+    else if(projecting)
         _snwprintf(line,ARRAYSIZE(line)-1,L"●  %ls",current_status);
+    else
+        _snwprintf(line,ARRAYSIZE(line)-1,L"%ls",current_status);
     line[ARRAYSIZE(line)-1]=0;SetWindowTextW(status_view,line);InvalidateRect(status_view,NULL,TRUE);
 }
 
@@ -492,7 +899,7 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
         lf.lfHeight=-MulDiv(17,dpi,72);font_about_title=CreateFontIndirectW(&lf);
         lf.lfHeight=-15; lf.lfWeight=FW_NORMAL; wcscpy(lf.lfFaceName,L"Consolas"); font_log=CreateFontIndirectW(&lf);
         brush_bg=CreateSolidBrush(CLR_BG); brush_card=CreateSolidBrush(CLR_CARD); brush_log=CreateSolidBrush(CLR_LOG_BG);
-        status_view=create_text(hwnd,L"●  正在初始化"); model_view=create_text(hwnd,L"设备型号\r\n—");
+        status_view=create_text(hwnd,L"正在初始化"); model_view=create_text(hwnd,L"设备型号\r\n—");
         serial_view=create_text(hwnd,L"设备序列号\r\n—"); android_view=create_text(hwnd,L"Android 版本\r\n—");
         slot_view=create_text(hwnd,L"当前槽位\r\n—"); kernel_view=create_text(hwnd,L"内核版本\r\n—");
         system_view=create_text(hwnd,L"系统版本\r\n—");ShowWindow(system_view,SW_HIDE);
@@ -627,9 +1034,12 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
     case WM_CTLCOLORSTATIC:
         SetBkMode((HDC)wparam,TRANSPARENT);
         if((HWND)lparam==log_view){SetTextColor((HDC)wparam,CLR_LOG_TEXT);SetBkColor((HDC)wparam,CLR_LOG_BG);return(LRESULT)brush_log;}
-        SetTextColor((HDC)wparam,(HWND)lparam==status_view?
-                     (InterlockedCompareExchange(&screen_is_off,0,0)?RGB(217,119,6):CLR_GREEN):
-                     ((HWND)lparam==quality_label?CLR_MUTED:CLR_TEXT));
+        if((HWND)lparam==status_view){
+            BOOL projecting=!wcscmp(current_status,L"正在投屏")||!wcscmp(current_status,L"兼容模式投屏中");
+            COLORREF status_color=!wcscmp(current_status,L"缺少运行文件")?CLR_ACCENT_PRESSED:
+                                  (projecting?(InterlockedCompareExchange(&screen_is_off,0,0)?RGB(217,119,6):CLR_GREEN):CLR_MUTED);
+            SetTextColor((HDC)wparam,status_color);
+        }else SetTextColor((HDC)wparam,(HWND)lparam==quality_label?CLR_MUTED:CLR_TEXT);
         if((HWND)lparam==model_view||(HWND)lparam==serial_view||(HWND)lparam==android_view||(HWND)lparam==slot_view||(HWND)lparam==kernel_view||(HWND)lparam==system_view)return(LRESULT)brush_card;
         return (LRESULT)brush_bg;
     case WM_CTLCOLOREDIT:
