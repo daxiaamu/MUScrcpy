@@ -5,7 +5,7 @@
 #include <stdio.h>
 #include <wchar.h>
 
-#define APP_VERSION L"2.3.2"
+#define APP_VERSION L"2.3.3"
 #define APP_TITLE L"MU投屏 " APP_VERSION L" daxiaamu.com"
 #define APP_MUTEX L"Daxiaamu.MUScrcpy.GUI.SingleInstance"
 #define WM_APP_LOG (WM_APP + 1)

@@ -21,8 +21,8 @@ MU投屏是一款面向 Windows 的轻量 Android 投屏启动器，基于 [scrc
 
 可直接从 [Releases](https://github.com/daxiaamu/MUScrcpy/releases) 下载包含 scrcpy 的完整包：
 
-- `MUScrcpy-v2.3.2-win64-scrcpy-v4.1.zip`：适用于 64 位 Windows
-- `MUScrcpy-v2.3.2-win32-scrcpy-v4.1.zip`：适用于 32 位 Windows
+- `MUScrcpy-v2.3.3-win64-scrcpy-v4.1.zip`：适用于 64 位 Windows
+- `MUScrcpy-v2.3.3-win32-scrcpy-v4.1.zip`：适用于 32 位 Windows
 
 从源码自行准备运行目录时：
 

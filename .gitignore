@@ -2,6 +2,11 @@
 MUScrcpy.exe
 MUScrcpy_new.exe
 *.res
+build/
+dist/
+release_build/
+release_cache/
+release_stage/
 
 # Bundled third-party runtime (keep only its update guide in source control)
 bin/*
