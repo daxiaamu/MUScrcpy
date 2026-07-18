@@ -14,6 +14,7 @@
 #define WM_APP_SCREEN (WM_APP + 4)
 #define WM_APP_START_WORKERS (WM_APP + 5)
 #define WM_APP_DOCK_SCRCPY (WM_APP + 6)
+#define WM_APP_DEVICE_STATE (WM_APP + 7)
 #define DOCK_TIMER_ID 1
 #define IDC_WAKE 1101
 #define IDC_COMPAT 1102
@@ -26,11 +27,7 @@
 #define IDM_QUALITY_HELP 2100
 #define IDM_CHECK_UPDATE 2101
 #define IDM_ABOUT 2102
-#define IDC_ABOUT_LOGO 2201
-#define IDC_ABOUT_TITLE 2202
-#define IDC_ABOUT_INFO 2203
-#define IDC_ABOUT_UPDATE 2204
-#define IDC_ABOUT_SCRCPY 2205
+#define IDC_ABOUT_LINK 2201
 
 #define CLR_BG RGB(246,247,249)
 #define CLR_CARD RGB(255,255,255)
@@ -52,7 +49,7 @@ typedef struct {
 static HINSTANCE app_instance;
 static HWND main_window, about_window, model_view, serial_view, android_view, slot_view, kernel_view, system_view;
 static HWND wake_button, compat_check, stay_awake_check, always_on_top_check, quality_label, quality_combo, quality_help, log_view, log_scroll, status_view;
-static HFONT font_normal, font_bold, font_log, font_about_title;
+static HFONT font_normal, font_bold, font_log, font_about_title, font_link;
 static HBRUSH brush_bg, brush_card, brush_log;
 static HANDLE stop_event, worker_handle, screen_worker_handle, mutex_handle, scrcpy_process;
 static CRITICAL_SECTION process_lock;
@@ -75,6 +72,14 @@ static HWND hot_button;
 static WNDPROC button_window_proc;
 static BOOL quality_combo_hover;
 static BOOL suppress_outside_click_up;
+static int normal_font_height = 16;
+static int info_row_height = 40;
+static int main_card_bottom = 295;
+static int quality_label_width = 38, quality_combo_width = 90, quality_help_width = 76;
+static int stay_awake_width = 84, compat_width = 84, always_on_top_width = 84;
+static int option_gap = 8;
+static BOOL device_info_fresh;
+static int about_title_height = 38;
 
 enum { QUALITY_AUTO, QUALITY_SMOOTH, QUALITY_BALANCED, QUALITY_HIGH, QUALITY_ULTRA };
 
@@ -295,10 +300,20 @@ static void read_device_info(DeviceInfo *d) {
 
 static DWORD WINAPI device_info_worker(LPVOID ignored) {
     DeviceInfo *d=(DeviceInfo*)HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,sizeof(DeviceInfo));
+    wchar_t expected_serial[160],current_serial[160];
     (void)ignored;
     if(!d)return 1;
+    expected_serial[0]=0;
+    if(!run_adb(L"-d get-serialno",expected_serial,ARRAYSIZE(expected_serial),3000)||!expected_serial[0]){
+        HeapFree(GetProcessHeap(),0,d);return 0;
+    }
     read_device_info(d);
     if(WaitForSingleObject(stop_event,0)==WAIT_OBJECT_0){HeapFree(GetProcessHeap(),0,d);return 0;}
+    current_serial[0]=0;
+    if(!run_adb(L"-d get-serialno",current_serial,ARRAYSIZE(current_serial),3000)||!current_serial[0]||
+       wcscmp(expected_serial,current_serial)!=0||wcscmp(expected_serial,d->serial)!=0){
+        HeapFree(GetProcessHeap(),0,d);return 0;
+    }
     PostMessageW(main_window,WM_APP_DEVICE,0,(LPARAM)d);
     post_log(L"设备信息读取完成。");
     return 0;
@@ -531,7 +546,10 @@ static DWORD WINAPI launcher_worker(LPVOID ignored) {
     while (WaitForSingleObject(stop_event, 0) != WAIT_OBJECT_0) {
         if (!device_is_online()) {
             info_requested=FALSE;
-            if (!waiting_logged) { post_status(L"等待设备连接"); post_log(L"等待 USB 设备，请确认已开启 USB 调试。"); waiting_logged = TRUE; }
+            if (!waiting_logged) {
+                PostMessageW(main_window,WM_APP_DEVICE_STATE,FALSE,0);
+                post_status(L"等待设备连接"); post_log(L"等待 USB 设备，请确认已开启 USB 调试。"); waiting_logged = TRUE;
+            }
             WaitForSingleObject(stop_event, 1000); continue;
         }
         waiting_logged = FALSE;
@@ -668,28 +686,90 @@ static LRESULT CALLBACK quality_combo_proc(HWND hwnd,UINT message,WPARAM wparam,
     return DefSubclassProc(hwnd,message,wparam,lparam);
 }
 
+static LRESULT CALLBACK device_text_proc(HWND hwnd,UINT message,WPARAM wparam,LPARAM lparam,
+                                         UINT_PTR subclass_id,DWORD_PTR data){
+    (void)wparam;(void)lparam;(void)subclass_id;(void)data;
+    if(message==WM_ERASEBKGND)return 1;
+    if(message==WM_PAINT){
+        PAINTSTRUCT ps;RECT client,label_rect,value_rect;HDC dc=BeginPaint(hwnd,&ps),buffer_dc;
+        HBITMAP bitmap,old_bitmap;HFONT old_font;wchar_t text[800],*value,*line_break;
+        int width,height;
+        GetClientRect(hwnd,&client);width=client.right;height=client.bottom;
+        GetWindowTextW(hwnd,text,ARRAYSIZE(text));line_break=wcsstr(text,L"\r\n");
+        if(line_break){*line_break=0;value=line_break+2;}else value=L"";
+        buffer_dc=CreateCompatibleDC(dc);bitmap=CreateCompatibleBitmap(dc,width>0?width:1,height>0?height:1);
+        old_bitmap=(HBITMAP)SelectObject(buffer_dc,bitmap);FillRect(buffer_dc,&client,brush_card);
+        old_font=(HFONT)SelectObject(buffer_dc,font_normal);SetBkMode(buffer_dc,TRANSPARENT);
+        label_rect=client;label_rect.bottom=normal_font_height+2;SetTextColor(buffer_dc,CLR_TEXT);
+        DrawTextW(buffer_dc,text,-1,&label_rect,DT_LEFT|DT_TOP|DT_SINGLELINE|DT_NOPREFIX);
+        value_rect=client;value_rect.top=normal_font_height+3;
+        SetTextColor(buffer_dc,device_info_fresh?CLR_TEXT:RGB(148,156,168));
+        DrawTextW(buffer_dc,value,-1,&value_rect,DT_LEFT|DT_TOP|DT_WORDBREAK|DT_EDITCONTROL|DT_NOPREFIX);
+        SelectObject(buffer_dc,old_font);BitBlt(dc,0,0,width,height,buffer_dc,0,0,SRCCOPY);
+        SelectObject(buffer_dc,old_bitmap);DeleteObject(bitmap);DeleteDC(buffer_dc);EndPaint(hwnd,&ps);return 0;
+    }
+    if(message==WM_NCDESTROY)RemoveWindowSubclass(hwnd,device_text_proc,1);
+    return DefSubclassProc(hwnd,message,wparam,lparam);
+}
+
+static int measure_device_view_height(HWND view,int width){
+    wchar_t text[800],*value,*line_break;RECT calculated={0,0,width,0};HDC dc;HFONT previous_font;
+    int value_height=normal_font_height,total;
+    GetWindowTextW(view,text,ARRAYSIZE(text));line_break=wcsstr(text,L"\r\n");
+    value=line_break?line_break+2:L"";
+    dc=GetDC(view);
+    if(dc){
+        previous_font=(HFONT)SelectObject(dc,font_normal);
+        if(value[0]&&DrawTextW(dc,value,-1,&calculated,DT_CALCRECT|DT_LEFT|DT_WORDBREAK|DT_EDITCONTROL|DT_NOPREFIX))
+            value_height=calculated.bottom-calculated.top;
+        SelectObject(dc,previous_font);ReleaseDC(view,dc);
+    }
+    if(value_height<normal_font_height)value_height=normal_font_height;
+    total=normal_font_height+3+value_height+3;
+    return total>info_row_height?total:info_row_height;
+}
+
 static void layout(HWND hwnd) {
-    RECT r; int width, card_width, half, y, log_height;
+    RECT r; int width, card_width, half, y, log_height, controls_y, controls_height, log_y;
+    int content_left,content_width,column_gap,left_width,right_width,right_x;
+    int row_height,model_height,serial_height,android_height,slot_height;
+    int system_height,kernel_height;
+    int help_x,combo_x,label_x,options_x;
     BOOL show_wake = InterlockedCompareExchange(&screen_is_off,0,0) != 0;
-    GetClientRect(hwnd, &r); width = r.right; card_width = width - 56; half = (card_width-24)/2;
-    MoveWindow(status_view,28,24,width-330,24,TRUE);
-    MoveWindow(quality_label,width-248,19,38,28,TRUE);
-    MoveWindow(quality_combo,width-204,19,90,180,TRUE);
-    MoveWindow(quality_help,width-104,19,76,28,TRUE);
-    y=76;
-    MoveWindow(model_view,44,y,half-16,48,TRUE); MoveWindow(serial_view,52+half,y,half-16,48,TRUE); y+=55;
-    MoveWindow(android_view,44,y,half-16,48,TRUE); MoveWindow(slot_view,52+half,y,half-16,48,TRUE); y+=55;
-    MoveWindow(system_view,44,y,card_width-32,48,TRUE); y+=55;
-    MoveWindow(kernel_view,44,y-3,card_width-32,54,TRUE);
+    GetClientRect(hwnd,&r);width=r.right;card_width=width-40;
+    content_left=34;content_width=card_width-28;column_gap=18;half=(content_width-column_gap)/2;
+    help_x=width-20-quality_help_width;combo_x=help_x-10-quality_combo_width;label_x=combo_x-6-quality_label_width;
+    MoveWindow(status_view,20,24,label_x-36,24,TRUE);
+    MoveWindow(quality_label,label_x,19,quality_label_width,28,TRUE);
+    MoveWindow(quality_combo,combo_x,19,quality_combo_width,180,TRUE);
+    MoveWindow(quality_help,help_x,19,quality_help_width,28,TRUE);
+    left_width=half;right_width=half;right_x=content_left+left_width+column_gap;y=74;
+    model_height=measure_device_view_height(model_view,left_width);
+    serial_height=measure_device_view_height(serial_view,right_width);row_height=model_height>serial_height?model_height:serial_height;
+    MoveWindow(model_view,content_left,y,left_width,row_height,TRUE);MoveWindow(serial_view,right_x,y,right_width,row_height,TRUE);y+=row_height+6;
+    android_height=measure_device_view_height(android_view,left_width);
+    slot_height=measure_device_view_height(slot_view,right_width);row_height=android_height>slot_height?android_height:slot_height;
+    MoveWindow(android_view,content_left,y,left_width,row_height,TRUE);MoveWindow(slot_view,right_x,y,right_width,row_height,TRUE);y+=row_height+6;
+    if(IsWindowVisible(system_view)){
+        system_height=measure_device_view_height(system_view,content_width);
+        MoveWindow(system_view,content_left,y,content_width,system_height,TRUE);y+=system_height+6;
+    }
+    kernel_height=measure_device_view_height(kernel_view,content_width);
+    MoveWindow(kernel_view,content_left,y,content_width,kernel_height,TRUE);y+=kernel_height;
+    main_card_bottom=y+10;
+    controls_y=main_card_bottom+12;controls_height=normal_font_height+12;
+    if(controls_height<42)controls_height=42;
+    log_y=controls_y+controls_height+16;
     ShowWindow(wake_button,SW_SHOW);
     EnableWindow(wake_button,show_wake);
-    MoveWindow(wake_button,28,307,130,42,TRUE);
-    MoveWindow(stay_awake_check,width-362,307,110,42,TRUE);
-    MoveWindow(compat_check,width-244,307,104,42,TRUE);
-    MoveWindow(always_on_top_check,width-132,307,104,42,TRUE);
-    log_height=r.bottom-389;
-    MoveWindow(log_view,28,365,card_width-16,log_height,TRUE);
-    MoveWindow(log_scroll,28+card_width-16,365,16,log_height,TRUE);
+    MoveWindow(wake_button,20,controls_y,130,controls_height,TRUE);
+    options_x=width-20-always_on_top_width;
+    MoveWindow(always_on_top_check,options_x,controls_y,always_on_top_width,controls_height,TRUE);
+    options_x-=option_gap+compat_width;MoveWindow(compat_check,options_x,controls_y,compat_width,controls_height,TRUE);
+    options_x-=option_gap+stay_awake_width;MoveWindow(stay_awake_check,options_x,controls_y,stay_awake_width,controls_height,TRUE);
+    log_height=r.bottom-log_y-20;if(log_height<1)log_height=1;
+    MoveWindow(log_view,20,log_y,card_width-16,log_height,TRUE);
+    MoveWindow(log_scroll,20+card_width-16,log_y,16,log_height,TRUE);
 }
 
 static BOOL get_log_thumb_rect(HWND scrollbar, RECT *thumb, int *visible_lines, int *total_lines) {
@@ -846,12 +926,28 @@ static void open_update_page(HWND owner){
         MessageBoxW(owner,L"无法打开更新页面。",L"打开失败",MB_OK|MB_ICONERROR);
 }
 
-static LRESULT CALLBACK about_static_proc(HWND hwnd,UINT message,WPARAM wparam,LPARAM lparam,
-                                          UINT_PTR subclass_id,DWORD_PTR data){
-    (void)wparam;(void)lparam;(void)subclass_id;(void)data;
-    if(message==WM_LBUTTONDOWN||message==WM_RBUTTONDOWN||message==WM_MBUTTONDOWN){
-        DestroyWindow(GetParent(hwnd));return 0;
+typedef struct {int divider_y,component_y,homepage_y,content_height;} AboutLayout;
+
+static AboutLayout get_about_layout(void){
+    AboutLayout layout;
+    int header_bottom=26+48;
+    int text_bottom=24+about_title_height+2+normal_font_height;
+    if(text_bottom>header_bottom)header_bottom=text_bottom;
+    layout.divider_y=header_bottom+16;
+    layout.component_y=layout.divider_y+16;
+    layout.homepage_y=layout.component_y+normal_font_height+12;
+    layout.content_height=layout.homepage_y+normal_font_height+26;
+    return layout;
+}
+
+static LRESULT CALLBACK about_link_proc(HWND hwnd,UINT message,WPARAM wparam,LPARAM lparam,
+                                        UINT_PTR subclass_id,DWORD_PTR data){
+    (void)lparam;(void)subclass_id;(void)data;
+    if(message==WM_SETCURSOR){SetCursor(LoadCursor(NULL,IDC_HAND));return TRUE;}
+    if(message==WM_KEYDOWN&&(wparam==VK_RETURN||wparam==VK_SPACE)){
+        open_update_page(GetParent(hwnd));return 0;
     }
+    if(message==WM_NCDESTROY)RemoveWindowSubclass(hwnd,about_link_proc,1);
     return DefSubclassProc(hwnd,message,wparam,lparam);
 }
 
@@ -861,35 +957,44 @@ static LRESULT CALLBACK about_proc(HWND hwnd,UINT message,WPARAM wparam,LPARAM l
     case WM_NCCREATE:
         SetWindowLongPtrW(hwnd,GWLP_USERDATA,(LONG_PTR)((CREATESTRUCTW*)lparam)->lpCreateParams);return TRUE;
     case WM_CREATE:{
-        RECT client;int width,title_width=290,info_width=290,link_width=112,logo_size=64;HICON icon;
-        HWND logo,title,info,scrcpy_info,link;wchar_t scrcpy_text[120];GetClientRect(hwnd,&client);width=client.right-client.left;
-        logo=CreateWindowW(L"STATIC",NULL,WS_CHILD|WS_VISIBLE|SS_ICON|SS_CENTERIMAGE,
-                           (width-logo_size)/2,30,logo_size,logo_size,hwnd,(HMENU)IDC_ABOUT_LOGO,app_instance,NULL);
-        icon=(HICON)LoadImageW(app_instance,MAKEINTRESOURCEW(1),IMAGE_ICON,logo_size,logo_size,LR_DEFAULTCOLOR|LR_SHARED);
-        if(icon)SendMessageW(logo,STM_SETICON,(WPARAM)icon,0);
-        title=CreateWindowW(L"STATIC",L"MU投屏",WS_CHILD|WS_VISIBLE|SS_CENTER,
-                            (width-title_width)/2,119,title_width,38,hwnd,(HMENU)IDC_ABOUT_TITLE,app_instance,NULL);
-        info=CreateWindowW(L"STATIC",L"v" APP_VERSION L"  ·  大侠阿木",WS_CHILD|WS_VISIBLE|SS_CENTER,
-                           (width-info_width)/2,166,info_width,24,hwnd,(HMENU)IDC_ABOUT_INFO,app_instance,NULL);
-        _snwprintf(scrcpy_text,ARRAYSIZE(scrcpy_text)-1,L"当前 scrcpy 版本：%ls",scrcpy_version);
-        scrcpy_text[ARRAYSIZE(scrcpy_text)-1]=0;
-        scrcpy_info=CreateWindowW(L"STATIC",scrcpy_text,WS_CHILD|WS_VISIBLE|SS_CENTER,
-                                  (width-info_width)/2,193,info_width,24,hwnd,(HMENU)IDC_ABOUT_SCRCPY,app_instance,NULL);
-        link=create_button(hwnd,L"检查更新",IDC_ABOUT_UPDATE);
-        MoveWindow(link,(width-link_width)/2,233,link_width,36,TRUE);
-        SendMessageW(title,WM_SETFONT,(WPARAM)(font_about_title?font_about_title:font_bold),TRUE);
-        SendMessageW(info,WM_SETFONT,(WPARAM)font_normal,TRUE);
-        SendMessageW(scrcpy_info,WM_SETFONT,(WPARAM)font_normal,TRUE);
-        SetWindowSubclass(logo,about_static_proc,1,0);SetWindowSubclass(title,about_static_proc,1,0);
-        SetWindowSubclass(info,about_static_proc,1,0);SetWindowSubclass(scrcpy_info,about_static_proc,1,0);return 0;
+        RECT client;AboutLayout layout=get_about_layout();HWND link;
+        GetClientRect(hwnd,&client);
+        link=CreateWindowW(L"STATIC",L"检查更新  →",WS_CHILD|WS_VISIBLE|WS_TABSTOP|SS_NOTIFY|SS_CENTERIMAGE,
+                           118,layout.homepage_y-2,client.right-146,normal_font_height+6,
+                           hwnd,(HMENU)IDC_ABOUT_LINK,app_instance,NULL);
+        SendMessageW(link,WM_SETFONT,(WPARAM)(font_link?font_link:font_normal),TRUE);
+        SetWindowSubclass(link,about_link_proc,1,0);
+        return 0;
     }
     case WM_ERASEBKGND:return 1;
     case WM_PAINT:{
-        PAINTSTRUCT ps;RECT client;HDC dc=BeginPaint(hwnd,&ps);GetClientRect(hwnd,&client);
-        FillRect(dc,&client,brush_bg);EndPaint(hwnd,&ps);return 0;
+        PAINTSTRUCT ps;RECT client,text_rect;HDC dc=BeginPaint(hwnd,&ps);HICON icon;
+        HFONT previous_font;HPEN pen,previous_pen;AboutLayout layout=get_about_layout();
+        wchar_t version_text[80],component_text[120];
+        GetClientRect(hwnd,&client);FillRect(dc,&client,brush_bg);SetBkMode(dc,TRANSPARENT);
+        icon=(HICON)LoadImageW(app_instance,MAKEINTRESOURCEW(1),IMAGE_ICON,48,48,LR_DEFAULTCOLOR|LR_SHARED);
+        if(icon)DrawIconEx(dc,28,26,icon,48,48,0,NULL,DI_NORMAL);
+        previous_font=(HFONT)SelectObject(dc,font_about_title?font_about_title:font_bold);SetTextColor(dc,CLR_TEXT);
+        SetRect(&text_rect,92,24,client.right-28,24+about_title_height+4);
+        DrawTextW(dc,L"MU投屏",-1,&text_rect,DT_LEFT|DT_TOP|DT_SINGLELINE|DT_NOPREFIX);
+        SelectObject(dc,font_normal);SetTextColor(dc,CLR_MUTED);
+        _snwprintf(version_text,ARRAYSIZE(version_text)-1,L"版本 %ls",APP_VERSION);version_text[ARRAYSIZE(version_text)-1]=0;
+        SetRect(&text_rect,92,24+about_title_height+2,client.right-28,24+about_title_height+2+normal_font_height+2);
+        DrawTextW(dc,version_text,-1,&text_rect,DT_LEFT|DT_TOP|DT_SINGLELINE|DT_NOPREFIX);
+        pen=CreatePen(PS_SOLID,1,CLR_BORDER);previous_pen=(HPEN)SelectObject(dc,pen);
+        MoveToEx(dc,28,layout.divider_y,NULL);LineTo(dc,client.right-28,layout.divider_y);
+        SelectObject(dc,previous_pen);DeleteObject(pen);
+        SetTextColor(dc,CLR_MUTED);SetRect(&text_rect,28,layout.component_y,108,layout.component_y+normal_font_height+2);
+        DrawTextW(dc,L"内置组件",-1,&text_rect,DT_LEFT|DT_TOP|DT_SINGLELINE|DT_NOPREFIX);
+        SetTextColor(dc,CLR_TEXT);_snwprintf(component_text,ARRAYSIZE(component_text)-1,L"scrcpy %ls",scrcpy_version);
+        component_text[ARRAYSIZE(component_text)-1]=0;SetRect(&text_rect,118,layout.component_y,client.right-28,layout.component_y+normal_font_height+2);
+        DrawTextW(dc,component_text,-1,&text_rect,DT_LEFT|DT_TOP|DT_SINGLELINE|DT_NOPREFIX);
+        SetTextColor(dc,CLR_MUTED);SetRect(&text_rect,28,layout.homepage_y,108,layout.homepage_y+normal_font_height+2);
+        DrawTextW(dc,L"版本更新",-1,&text_rect,DT_LEFT|DT_TOP|DT_SINGLELINE|DT_NOPREFIX);
+        SelectObject(dc,previous_font);EndPaint(hwnd,&ps);return 0;
     }
     case WM_COMMAND:
-        if(LOWORD(wparam)==IDC_ABOUT_UPDATE){open_update_page(hwnd);return 0;}
+        if(LOWORD(wparam)==IDC_ABOUT_LINK&&HIWORD(wparam)==STN_CLICKED){open_update_page(hwnd);return 0;}
         if(LOWORD(wparam)==IDCANCEL){DestroyWindow(hwnd);return 0;}break;
     case WM_LBUTTONDOWN:case WM_RBUTTONDOWN:case WM_MBUTTONDOWN:
         DestroyWindow(hwnd);return 0;
@@ -899,16 +1004,13 @@ static LRESULT CALLBACK about_proc(HWND hwnd,UINT message,WPARAM wparam,LPARAM l
             if(next!=owner_window&&!IsChild(hwnd,next))DestroyWindow(hwnd);
         }
         return 0;
-    case WM_DRAWITEM:
-        if(wparam==IDC_ABOUT_UPDATE){draw_owner_button((const DRAWITEMSTRUCT*)lparam);return TRUE;}break;
     case WM_CTLCOLORSTATIC:
         SetBkMode((HDC)wparam,TRANSPARENT);
-        SetTextColor((HDC)wparam,(GetDlgCtrlID((HWND)lparam)==IDC_ABOUT_INFO||GetDlgCtrlID((HWND)lparam)==IDC_ABOUT_SCRCPY)?CLR_MUTED:CLR_TEXT);
+        SetTextColor((HDC)wparam,GetDlgCtrlID((HWND)lparam)==IDC_ABOUT_LINK?CLR_ACCENT:CLR_TEXT);
         return (LRESULT)brush_bg;
     case WM_CLOSE:DestroyWindow(hwnd);return 0;
     case WM_DESTROY:
         owner=(HWND)GetWindowLongPtrW(hwnd,GWLP_USERDATA);
-        if(hot_button&&IsChild(hwnd,hot_button))hot_button=NULL;
         if(about_window==hwnd)about_window=NULL;
         if(owner)SetForegroundWindow(owner);
         return 0;
@@ -917,21 +1019,25 @@ static LRESULT CALLBACK about_proc(HWND hwnd,UINT message,WPARAM wparam,LPARAM l
 }
 
 static void show_about_window(HWND owner){
-    static BOOL registered;WNDCLASSW wc;RECT owner_rect;int width=380,height=330,x=CW_USEDEFAULT,y=CW_USEDEFAULT;HWND dialog;
+    static BOOL registered;WNDCLASSW wc;RECT owner_rect,desired;DWORD style=WS_POPUP|WS_CAPTION|WS_SYSMENU|WS_CLIPCHILDREN;
+    AboutLayout layout;int width,height,x=CW_USEDEFAULT,y=CW_USEDEFAULT;HWND dialog;
     if(about_window&&IsWindow(about_window)){SetForegroundWindow(about_window);return;}
     if(!registered){
         ZeroMemory(&wc,sizeof(wc));wc.lpfnWndProc=about_proc;wc.hInstance=app_instance;
-        wc.lpszClassName=L"MUScrcpyAboutWindow";wc.hIcon=LoadIcon(app_instance,MAKEINTRESOURCE(1));
+        wc.lpszClassName=L"MUScrcpyAboutWindow";wc.hIcon=NULL;
         wc.hCursor=LoadCursor(NULL,IDC_ARROW);wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1);
         if(!RegisterClassW(&wc)&&GetLastError()!=ERROR_CLASS_ALREADY_EXISTS)return;
         registered=TRUE;
     }
+    layout=get_about_layout();SetRect(&desired,0,0,360,layout.content_height);
+    AdjustWindowRectEx(&desired,style,FALSE,WS_EX_DLGMODALFRAME);
+    width=desired.right-desired.left;height=desired.bottom-desired.top;
     if(GetWindowRect(owner,&owner_rect)){
         x=owner_rect.left+((owner_rect.right-owner_rect.left)-width)/2;
         y=owner_rect.top+((owner_rect.bottom-owner_rect.top)-height)/2;
     }
     dialog=CreateWindowExW(WS_EX_DLGMODALFRAME,L"MUScrcpyAboutWindow",L"关于 MU投屏",
-                           WS_POPUP|WS_CAPTION|WS_SYSMENU|WS_CLIPCHILDREN,x,y,width,height,
+                           style,x,y,width,height,
                            owner,NULL,app_instance,owner);
     if(!dialog)return;
     about_window=dialog;ShowWindow(dialog,SW_SHOW);UpdateWindow(dialog);
@@ -954,14 +1060,50 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
     case WM_CREATE: {
         LOGFONTW lf;HDC screen_dc=GetDC(NULL);int dpi=screen_dc?GetDeviceCaps(screen_dc,LOGPIXELSY):96;if(screen_dc)ReleaseDC(NULL,screen_dc);
         ZeroMemory(&lf,sizeof(lf)); lf.lfHeight=-MulDiv(9,dpi,72);lf.lfQuality=CLEARTYPE_QUALITY;wcscpy(lf.lfFaceName,L"Segoe UI");
-        font_normal=CreateFontIndirectW(&lf); lf.lfWeight=FW_SEMIBOLD; font_bold=CreateFontIndirectW(&lf);
+        font_normal=CreateFontIndirectW(&lf);lf.lfUnderline=TRUE;font_link=CreateFontIndirectW(&lf);lf.lfUnderline=FALSE;
+        lf.lfWeight=FW_SEMIBOLD; font_bold=CreateFontIndirectW(&lf);
         lf.lfHeight=-MulDiv(17,dpi,72);font_about_title=CreateFontIndirectW(&lf);
         lf.lfHeight=-15; lf.lfWeight=FW_NORMAL; wcscpy(lf.lfFaceName,L"Consolas"); font_log=CreateFontIndirectW(&lf);
+        {
+            HDC dc=GetDC(hwnd);HFONT previous_font;
+            if(dc){
+                TEXTMETRICW metrics;SIZE text_size;int candidate;previous_font=(HFONT)SelectObject(dc,font_normal);
+                if(GetTextMetricsW(dc,&metrics))normal_font_height=metrics.tmHeight;
+                if(GetTextExtentPoint32W(dc,L"\x753b\x8d28",2,&text_size)){
+                    candidate=text_size.cx+8;if(candidate>quality_label_width)quality_label_width=candidate;
+                    candidate=text_size.cx+36;if(candidate>quality_combo_width)quality_combo_width=candidate;
+                }
+                if(GetTextExtentPoint32W(dc,L"\x5e2e\x52a9  \x25be",5,&text_size)){
+                    candidate=text_size.cx+12;if(candidate>quality_help_width)quality_help_width=candidate;
+                }
+                if(GetTextExtentPoint32W(dc,L"\x4fdd\x6301\x4eae\x5c4f",4,&text_size)){
+                    stay_awake_width=text_size.cx+27;
+                }
+                if(GetTextExtentPoint32W(dc,L"\x517c\x5bb9\x6a21\x5f0f",4,&text_size)){
+                    compat_width=text_size.cx+27;
+                }
+                if(GetTextExtentPoint32W(dc,L"\x6295\x5c4f\x7f6e\x9876",4,&text_size)){
+                    always_on_top_width=text_size.cx+27;
+                }
+                SelectObject(dc,font_about_title);
+                if(GetTextMetricsW(dc,&metrics))about_title_height=metrics.tmHeight;
+                SelectObject(dc,previous_font);ReleaseDC(hwnd,dc);
+            }
+            info_row_height=normal_font_height*2+6;
+            if(info_row_height<40)info_row_height=40;
+            option_gap=normal_font_height/2;
+            if(option_gap<6)option_gap=6;
+            if(option_gap>14)option_gap=14;
+        }
         brush_bg=CreateSolidBrush(CLR_BG); brush_card=CreateSolidBrush(CLR_CARD); brush_log=CreateSolidBrush(CLR_LOG_BG);
         status_view=create_text(hwnd,L"正在初始化"); model_view=create_text(hwnd,L"设备型号\r\n—");
         serial_view=create_text(hwnd,L"设备序列号\r\n—"); android_view=create_text(hwnd,L"Android 版本\r\n—");
         slot_view=create_text(hwnd,L"当前槽位\r\n—"); kernel_view=create_text(hwnd,L"内核版本\r\n—");
         system_view=create_text(hwnd,L"系统版本\r\n—");ShowWindow(system_view,SW_HIDE);
+        SetWindowSubclass(model_view,device_text_proc,1,0);SetWindowSubclass(serial_view,device_text_proc,1,0);
+        SetWindowSubclass(android_view,device_text_proc,1,0);SetWindowSubclass(slot_view,device_text_proc,1,0);
+        SetWindowSubclass(kernel_view,device_text_proc,1,0);
+        SetWindowSubclass(system_view,device_text_proc,1,0);
         wake_button=create_button(hwnd,L"点亮屏幕",IDC_WAKE);
         stay_awake_check=create_checkbox(hwnd,L"保持亮屏",IDC_STAY_AWAKE);
         compat_check=create_checkbox(hwnd,L"兼容模式",IDC_COMPAT);
@@ -976,7 +1118,8 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
             COMBOBOXINFO info;ZeroMemory(&info,sizeof(info));info.cbSize=sizeof(info);
             if(GetComboBoxInfo(quality_combo,&info)&&info.hwndList)SetWindowSubclass(info.hwndList,quality_list_proc,1,0);
         }
-        SendMessageW(quality_combo,CB_SETITEMHEIGHT,(WPARAM)-1,26);SendMessageW(quality_combo,CB_SETITEMHEIGHT,0,28);
+        SendMessageW(quality_combo,CB_SETITEMHEIGHT,(WPARAM)-1,normal_font_height+2>26?normal_font_height+2:26);
+        SendMessageW(quality_combo,CB_SETITEMHEIGHT,0,normal_font_height+6>28?normal_font_height+6:28);
         SendMessageW(quality_combo,CB_ADDSTRING,0,(LPARAM)L"自动");
         SendMessageW(quality_combo,CB_ADDSTRING,0,(LPARAM)L"流畅");
         SendMessageW(quality_combo,CB_ADDSTRING,0,(LPARAM)L"均衡");
@@ -994,8 +1137,25 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
         return 0;
     }
     case WM_GETMINMAXINFO:
-        ((MINMAXINFO*)lparam)->ptMinTrackSize.x=700;
-        ((MINMAXINFO*)lparam)->ptMinTrackSize.y=600;
+        {
+            MINMAXINFO *limits=(MINMAXINFO*)lparam;
+            MONITORINFO monitor_info;HMONITOR monitor=MonitorFromWindow(hwnd,MONITOR_DEFAULTTONEAREST);
+            RECT window_rect,client_rect;int min_width=680,min_height=600;
+            int required_client_width=20+130+normal_font_height+stay_awake_width+compat_width+
+                                      always_on_top_width+option_gap*2+20;
+            if(GetWindowRect(hwnd,&window_rect)&&GetClientRect(hwnd,&client_rect)){
+                int nonclient_width=(window_rect.right-window_rect.left)-(client_rect.right-client_rect.left);
+                if(required_client_width+nonclient_width>min_width)min_width=required_client_width+nonclient_width;
+            }
+            ZeroMemory(&monitor_info,sizeof(monitor_info));monitor_info.cbSize=sizeof(monitor_info);
+            if(monitor&&GetMonitorInfoW(monitor,&monitor_info)){
+                int work_width=monitor_info.rcWork.right-monitor_info.rcWork.left;
+                int work_height=monitor_info.rcWork.bottom-monitor_info.rcWork.top;
+                if(min_width>work_width)min_width=work_width;
+                if(min_height>work_height)min_height=work_height;
+            }
+            limits->ptMinTrackSize.x=min_width;limits->ptMinTrackSize.y=min_height;
+        }
         return 0;
     case WM_SIZE:
         layout(hwnd);
@@ -1103,7 +1263,7 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
     case WM_PAINT: {
         PAINTSTRUCT ps; HDC dc=BeginPaint(hwnd,&ps); RECT r,card;
         GetClientRect(hwnd,&r); FillRect(dc,&r,brush_bg); SetBkMode(dc,TRANSPARENT);
-        SetRect(&card,28,60,r.right-28,295);FillRect(dc,&card,brush_card);
+        SetRect(&card,20,60,r.right-20,main_card_bottom);FillRect(dc,&card,brush_card);
         EndPaint(hwnd,&ps);
         if(InterlockedCompareExchange(&workers_started,1,0)==0)PostMessageW(hwnd,WM_APP_START_WORKERS,0,0);
         return 0;
@@ -1128,8 +1288,15 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
         if(s) HeapFree(GetProcessHeap(),0,s);
         return 0;
     }
+    case WM_APP_DEVICE_STATE:
+        device_info_fresh=(BOOL)wparam;
+        InvalidateRect(model_view,NULL,FALSE);InvalidateRect(serial_view,NULL,FALSE);
+        InvalidateRect(android_view,NULL,FALSE);InvalidateRect(slot_view,NULL,FALSE);
+        InvalidateRect(kernel_view,NULL,FALSE);InvalidateRect(system_view,NULL,FALSE);
+        return 0;
     case WM_APP_DEVICE: {
         DeviceInfo *d=(DeviceInfo*)lparam;wchar_t text[800];
+        device_info_fresh=TRUE;
         if(d->market_name[0]) _snwprintf(text,ARRAYSIZE(text)-1,L"设备型号\r\n%ls（%ls）",d->market_name,d->model);
         else _snwprintf(text,ARRAYSIZE(text)-1,L"设备型号\r\n%ls",d->model);
         SetWindowTextW(model_view,text);
@@ -1137,12 +1304,16 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
         _snwprintf(text,ARRAYSIZE(text)-1,L"Android 版本\r\n%ls",d->android);SetWindowTextW(android_view,text);
         _snwprintf(text,ARRAYSIZE(text)-1,L"当前槽位\r\n%ls",d->slot);SetWindowTextW(slot_view,text);
         _snwprintf(text,ARRAYSIZE(text)-1,L"内核版本\r\n%ls",d->kernel);SetWindowTextW(kernel_view,text);
-        wcscpy(text,L"系统版本\r\n");
-        if(d->build_display[0]) wcscat(text,d->build_display);
-        if(d->rom_version[0]){if(d->build_display[0])wcscat(text,L"    |    ");wcscat(text,d->rom_version);}
-        if(d->ota_version[0]){if(d->build_display[0]||d->rom_version[0])wcscat(text,L"    |    ");wcscat(text,d->ota_version);}
+        wcscpy(text,L"系统版本");
+        if(d->build_display[0]){wcscat(text,L"\r\n");wcscat(text,d->build_display);}
+        if(d->rom_version[0]){wcscat(text,L"\r\n");wcscat(text,d->rom_version);}
+        if(d->ota_version[0]){wcscat(text,L"\r\n");wcscat(text,d->ota_version);}
         if(d->build_display[0]||d->rom_version[0]||d->ota_version[0]){SetWindowTextW(system_view,text);ShowWindow(system_view,SW_SHOW);}
         else ShowWindow(system_view,SW_HIDE);
+        layout(hwnd);
+        InvalidateRect(model_view,NULL,FALSE);InvalidateRect(serial_view,NULL,FALSE);
+        InvalidateRect(android_view,NULL,FALSE);InvalidateRect(slot_view,NULL,FALSE);
+        InvalidateRect(kernel_view,NULL,FALSE);InvalidateRect(system_view,NULL,FALSE);
         HeapFree(GetProcessHeap(),0,d);return 0;
     }
     case WM_APP_SCREEN:
@@ -1157,21 +1328,22 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
     case WM_DESTROY:
         if(worker_handle) CloseHandle(worker_handle);
         if(screen_worker_handle) CloseHandle(screen_worker_handle);
-        DeleteObject(font_normal);DeleteObject(font_bold);DeleteObject(font_log);DeleteObject(font_about_title);
+        DeleteObject(font_normal);DeleteObject(font_bold);DeleteObject(font_log);DeleteObject(font_about_title);DeleteObject(font_link);
         DeleteObject(brush_bg);DeleteObject(brush_card);DeleteObject(brush_log);PostQuitMessage(0);return 0;
     }
     return DefWindowProcW(hwnd,message,wparam,lparam);
 }
 
 int WINAPI wWinMain(HINSTANCE instance,HINSTANCE previous,LPWSTR command_line,int show) {
-    WNDCLASSEXW wc;WNDCLASSW scroll_class;MSG message;HWND existing;
+    WNDCLASSEXW wc;WNDCLASSW scroll_class;MSG message;HWND existing;RECT work_area;
+    int initial_width=680,initial_height=660;
     (void)previous;(void)command_line;app_instance=instance;
     {
-        HMODULE user32=GetModuleHandleW(L"user32.dll");
-        typedef BOOL (WINAPI *SetProcessDpiAwarenessContextFn)(HANDLE);
-        union { FARPROC raw; SetProcessDpiAwarenessContextFn call; } set_process_dpi_context;
-        set_process_dpi_context.raw=user32?GetProcAddress(user32,"SetProcessDpiAwarenessContext"):NULL;
-        if(set_process_dpi_context.call)set_process_dpi_context.call((HANDLE)(LONG_PTR)-5);
+        HMODULE user32 = GetModuleHandleW(L"user32.dll");
+        typedef BOOL (WINAPI *SetDpiAwareFn)(void);
+        union { FARPROC raw; SetDpiAwareFn call; } set_dpi_aware;
+        set_dpi_aware.raw = user32 ? GetProcAddress(user32, "SetProcessDPIAware") : NULL;
+        if (set_dpi_aware.call) set_dpi_aware.call();
     }
     mutex_handle=CreateMutexW(NULL,TRUE,APP_MUTEX);if(!mutex_handle)return 1;
     if(GetLastError()==ERROR_ALREADY_EXISTS){existing=FindWindowW(L"MUScrcpyGuiWindow",APP_TITLE);if(existing){if(IsIconic(existing))ShowWindow(existing,SW_RESTORE);SetForegroundWindow(existing);}CloseHandle(mutex_handle);return 0;}
@@ -1184,7 +1356,13 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE previous,LPWSTR command_line,in
     ZeroMemory(&scroll_class,sizeof(scroll_class));scroll_class.hInstance=instance;scroll_class.lpfnWndProc=log_scroll_proc;
     scroll_class.lpszClassName=L"MULogScrollbar";scroll_class.hCursor=LoadCursor(NULL,IDC_ARROW);
     if(!RegisterClassW(&scroll_class))return 1;
-    main_window=CreateWindowExW(0,wc.lpszClassName,APP_TITLE,WS_OVERLAPPEDWINDOW&~WS_MAXIMIZEBOX,CW_USEDEFAULT,CW_USEDEFAULT,700,660,NULL,NULL,instance,NULL);
+    if(SystemParametersInfoW(SPI_GETWORKAREA,0,&work_area,0)){
+        int work_width=work_area.right-work_area.left,work_height=work_area.bottom-work_area.top;
+        if(initial_width>work_width)initial_width=work_width;
+        if(initial_height>work_height)initial_height=work_height;
+    }
+    main_window=CreateWindowExW(0,wc.lpszClassName,APP_TITLE,WS_OVERLAPPEDWINDOW&~WS_MAXIMIZEBOX,CW_USEDEFAULT,CW_USEDEFAULT,
+                              initial_width,initial_height,NULL,NULL,instance,NULL);
     if(!main_window) return 1;
     ShowWindow(main_window,show);UpdateWindow(main_window);
     while(GetMessageW(&message,NULL,0,0)>0){
