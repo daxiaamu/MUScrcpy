@@ -5,7 +5,7 @@
 #include <stdio.h>
 #include <wchar.h>
 
-#define APP_VERSION L"2.3.3"
+#define APP_VERSION L"2.3.4"
 #define APP_TITLE L"MU投屏 " APP_VERSION L" daxiaamu.com"
 #define APP_MUTEX L"Daxiaamu.MUScrcpy.GUI.SingleInstance"
 #define WM_APP_LOG (WM_APP + 1)
@@ -16,6 +16,7 @@
 #define WM_APP_DOCK_SCRCPY (WM_APP + 6)
 #define WM_APP_DEVICE_STATE (WM_APP + 7)
 #define DOCK_TIMER_ID 1
+#define SCRCPY_BOUNDS_TIMER_ID 2
 #define IDC_WAKE 1101
 #define IDC_COMPAT 1102
 #define IDC_STAY_AWAKE 1103
@@ -28,6 +29,7 @@
 #define IDM_CHECK_UPDATE 2101
 #define IDM_ABOUT 2102
 #define IDC_ABOUT_LINK 2201
+#define IDC_ABOUT_SOURCE 2202
 
 #define CLR_BG RGB(246,247,249)
 #define CLR_CARD RGB(255,255,255)
@@ -416,6 +418,75 @@ static void keep_window_in_work_area(const RECT *work_area,const RECT *window_re
     *y=visible_y-(visible_rect->top-window_rect->top);
 }
 
+static BOOL constrain_scrcpy_to_own_monitor(HWND scrcpy) {
+    RECT window_rect,visible_rect,work_area;
+    MONITORINFO monitor_info;
+    HMONITOR monitor;
+    HANDLE previous_dpi_context;
+    int visible_width,visible_height,work_width,work_height;
+    int fit_width,fit_height;
+    int target_visible_width,target_visible_height;
+    int target_window_width,target_window_height;
+    int x,y;
+    BOOL needs_resize=FALSE,needs_move=FALSE;
+    if(!scrcpy||!IsWindow(scrcpy)||IsIconic(scrcpy))return FALSE;
+    previous_dpi_context=enter_physical_dpi_context();
+    GetWindowRect(scrcpy,&window_rect);
+    get_visible_window_rect(scrcpy,&visible_rect);
+    monitor=MonitorFromWindow(scrcpy,MONITOR_DEFAULTTONEAREST);
+    ZeroMemory(&monitor_info,sizeof(monitor_info));monitor_info.cbSize=sizeof(monitor_info);
+    if(!monitor||!GetMonitorInfoW(monitor,&monitor_info)){
+        leave_physical_dpi_context(previous_dpi_context);return FALSE;
+    }
+    work_area=monitor_info.rcWork;
+    visible_width=visible_rect.right-visible_rect.left;
+    visible_height=visible_rect.bottom-visible_rect.top;
+    work_width=work_area.right-work_area.left;
+    work_height=work_area.bottom-work_area.top;
+    fit_width=MulDiv(work_width,95,100);
+    fit_height=MulDiv(work_height,95,100);
+    target_visible_width=visible_width;
+    target_visible_height=visible_height;
+    if(visible_width>work_width||visible_height>work_height){
+        if(target_visible_width>fit_width){
+            target_visible_height=MulDiv(target_visible_height,fit_width,target_visible_width);
+            target_visible_width=fit_width;
+        }
+        if(target_visible_height>fit_height){
+            target_visible_width=MulDiv(target_visible_width,fit_height,target_visible_height);
+            target_visible_height=fit_height;
+        }
+        needs_resize=TRUE;
+    }
+    target_window_width=(window_rect.right-window_rect.left)-visible_width+target_visible_width;
+    target_window_height=(window_rect.bottom-window_rect.top)-visible_height+target_visible_height;
+    x=window_rect.left;y=window_rect.top;
+    if(needs_resize){
+        int visible_x=x+(visible_rect.left-window_rect.left);
+        int visible_y=y+(visible_rect.top-window_rect.top);
+        int inset_x=(work_width-fit_width)/2;
+        int inset_y=(work_height-fit_height)/2;
+        if(visible_x<work_area.left+inset_x)visible_x=work_area.left+inset_x;
+        if(visible_y<work_area.top+inset_y)visible_y=work_area.top+inset_y;
+        if(visible_x+target_visible_width>work_area.right-inset_x)
+            visible_x=work_area.right-inset_x-target_visible_width;
+        if(visible_y+target_visible_height>work_area.bottom-inset_y)
+            visible_y=work_area.bottom-inset_y-target_visible_height;
+        x=visible_x-(visible_rect.left-window_rect.left);
+        y=visible_y-(visible_rect.top-window_rect.top);
+    }else{
+        int original_x=x,original_y=y;
+        keep_window_in_work_area(&work_area,&window_rect,&visible_rect,&x,&y);
+        needs_move=x!=original_x||y!=original_y;
+    }
+    if(needs_resize||needs_move){
+        SetWindowPos(scrcpy,NULL,x,y,target_window_width,target_window_height,
+                     SWP_NOZORDER|SWP_NOACTIVATE);
+    }
+    leave_physical_dpi_context(previous_dpi_context);
+    return needs_resize||needs_move;
+}
+
 static BOOL position_scrcpy_window(HWND gui,HWND scrcpy,HWND insert_after,UINT flags) {
     RECT gui_visible,scrcpy_rect,scrcpy_visible,work_area;
     HANDLE previous_dpi_context;
@@ -443,6 +514,7 @@ static BOOL dock_scrcpy_window(HWND gui, BOOL bring_forward) {
     if(IsIconic(scrcpy))ShowWindow(scrcpy,SW_SHOWNOACTIVATE);
     if(!position_scrcpy_window(gui,scrcpy,HWND_TOP,SWP_NOACTIVATE|SWP_SHOWWINDOW))return FALSE;
     docked_scrcpy_window=scrcpy;
+    SetTimer(gui,SCRCPY_BOUNDS_TIMER_ID,500,NULL);
     if(bring_forward){
         SetWindowPos(scrcpy,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_SHOWWINDOW);
         SetWindowPos(gui,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_SHOWWINDOW);
@@ -489,6 +561,31 @@ static void append_quality_options(wchar_t *command, int quality) {
     else if(quality==QUALITY_ULTRA) wcscat(command,L" --max-fps=120 --video-bit-rate=20M");
 }
 
+static void append_target_monitor_position(wchar_t *command,size_t capacity) {
+    RECT work_area;
+    wchar_t arguments[96];
+    HANDLE previous_dpi_context;
+    size_t used,additional;
+    int x,y;
+    if(!main_window||!IsWindow(main_window))return;
+    previous_dpi_context=enter_physical_dpi_context();
+    if(!get_window_work_area(main_window,&work_area)){
+        leave_physical_dpi_context(previous_dpi_context);return;
+    }
+    /*
+     * Keep the requested top-left point safely inside the target monitor.
+     * scrcpy/SDL can then select that display before calculating its automatic
+     * initial size. The docking code will move the window without resizing it.
+     */
+    x=work_area.left+16;
+    y=work_area.top+16;
+    leave_physical_dpi_context(previous_dpi_context);
+    _snwprintf(arguments,ARRAYSIZE(arguments)-1,L" --window-x=%d --window-y=%d",x,y);
+    arguments[ARRAYSIZE(arguments)-1]=0;
+    used=wcslen(command);additional=wcslen(arguments);
+    if(used+additional<capacity)wcscat(command,arguments);
+}
+
 static void launch_scrcpy(void) {
     SECURITY_ATTRIBUTES sa;
     STARTUPINFOW si;
@@ -507,9 +604,10 @@ static void launch_scrcpy(void) {
     _snwprintf(command, ARRAYSIZE(command)-1, L"\"%ls\"", exe);
     command[ARRAYSIZE(command)-1] = 0;
     if (compatible) wcscat(command,L" -d --render-driver=software --no-audio");
-    if (stay_awake) wcscat(command,L" --stay-awake");
+    if (stay_awake) wcscat(command,L" --keep-active");
     if (always_on_top) wcscat(command,L" --always-on-top");
     append_quality_options(command,effective_quality);
+    append_target_monitor_position(command,ARRAYSIZE(command));
     ZeroMemory(&si, sizeof(si)); ZeroMemory(&pi, sizeof(pi)); si.cb = sizeof(si);
     si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES; si.wShowWindow = SW_HIDE;
     si.hStdOutput = write_pipe; si.hStdError = write_pipe; si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
@@ -926,17 +1024,23 @@ static void open_update_page(HWND owner){
         MessageBoxW(owner,L"无法打开更新页面。",L"打开失败",MB_OK|MB_ICONERROR);
 }
 
-typedef struct {int divider_y,component_y,homepage_y,content_height;} AboutLayout;
+static void open_source_page(HWND owner){
+    if((INT_PTR)ShellExecuteW(owner,L"open",L"https://github.com/daxiaamu/MUScrcpy",NULL,NULL,SW_SHOWNORMAL)<=32)
+        MessageBoxW(owner,L"无法打开开源地址。",L"打开失败",MB_OK|MB_ICONERROR);
+}
+
+typedef struct {int divider_y,component_y,homepage_y,source_y,content_height;} AboutLayout;
 
 static AboutLayout get_about_layout(void){
     AboutLayout layout;
-    int header_bottom=26+48;
-    int text_bottom=24+about_title_height+2+normal_font_height;
+    int header_bottom=30+56;
+    int text_bottom=28+about_title_height+4+normal_font_height;
     if(text_bottom>header_bottom)header_bottom=text_bottom;
-    layout.divider_y=header_bottom+16;
-    layout.component_y=layout.divider_y+16;
-    layout.homepage_y=layout.component_y+normal_font_height+12;
-    layout.content_height=layout.homepage_y+normal_font_height+26;
+    layout.divider_y=header_bottom+24;
+    layout.component_y=layout.divider_y+22;
+    layout.homepage_y=layout.component_y+normal_font_height+16;
+    layout.source_y=layout.homepage_y+normal_font_height+16;
+    layout.content_height=layout.source_y+normal_font_height+34;
     return layout;
 }
 
@@ -945,7 +1049,9 @@ static LRESULT CALLBACK about_link_proc(HWND hwnd,UINT message,WPARAM wparam,LPA
     (void)lparam;(void)subclass_id;(void)data;
     if(message==WM_SETCURSOR){SetCursor(LoadCursor(NULL,IDC_HAND));return TRUE;}
     if(message==WM_KEYDOWN&&(wparam==VK_RETURN||wparam==VK_SPACE)){
-        open_update_page(GetParent(hwnd));return 0;
+        if(GetDlgCtrlID(hwnd)==IDC_ABOUT_SOURCE)open_source_page(GetParent(hwnd));
+        else open_update_page(GetParent(hwnd));
+        return 0;
     }
     if(message==WM_NCDESTROY)RemoveWindowSubclass(hwnd,about_link_proc,1);
     return DefSubclassProc(hwnd,message,wparam,lparam);
@@ -957,13 +1063,18 @@ static LRESULT CALLBACK about_proc(HWND hwnd,UINT message,WPARAM wparam,LPARAM l
     case WM_NCCREATE:
         SetWindowLongPtrW(hwnd,GWLP_USERDATA,(LONG_PTR)((CREATESTRUCTW*)lparam)->lpCreateParams);return TRUE;
     case WM_CREATE:{
-        RECT client;AboutLayout layout=get_about_layout();HWND link;
+        RECT client;AboutLayout layout=get_about_layout();HWND link,source_link;
         GetClientRect(hwnd,&client);
         link=CreateWindowW(L"STATIC",L"检查更新  →",WS_CHILD|WS_VISIBLE|WS_TABSTOP|SS_NOTIFY|SS_CENTERIMAGE,
-                           118,layout.homepage_y-2,client.right-146,normal_font_height+6,
+                           126,layout.homepage_y-3,client.right-158,normal_font_height+8,
                            hwnd,(HMENU)IDC_ABOUT_LINK,app_instance,NULL);
         SendMessageW(link,WM_SETFONT,(WPARAM)(font_link?font_link:font_normal),TRUE);
         SetWindowSubclass(link,about_link_proc,1,0);
+        source_link=CreateWindowW(L"STATIC",L"GitHub 开源仓库  →",WS_CHILD|WS_VISIBLE|WS_TABSTOP|SS_NOTIFY|SS_CENTERIMAGE,
+                                  126,layout.source_y-3,client.right-158,normal_font_height+8,
+                                  hwnd,(HMENU)IDC_ABOUT_SOURCE,app_instance,NULL);
+        SendMessageW(source_link,WM_SETFONT,(WPARAM)(font_link?font_link:font_normal),TRUE);
+        SetWindowSubclass(source_link,about_link_proc,1,0);
         return 0;
     }
     case WM_ERASEBKGND:return 1;
@@ -972,29 +1083,32 @@ static LRESULT CALLBACK about_proc(HWND hwnd,UINT message,WPARAM wparam,LPARAM l
         HFONT previous_font;HPEN pen,previous_pen;AboutLayout layout=get_about_layout();
         wchar_t version_text[80],component_text[120];
         GetClientRect(hwnd,&client);FillRect(dc,&client,brush_bg);SetBkMode(dc,TRANSPARENT);
-        icon=(HICON)LoadImageW(app_instance,MAKEINTRESOURCEW(1),IMAGE_ICON,48,48,LR_DEFAULTCOLOR|LR_SHARED);
-        if(icon)DrawIconEx(dc,28,26,icon,48,48,0,NULL,DI_NORMAL);
+        icon=(HICON)LoadImageW(app_instance,MAKEINTRESOURCEW(1),IMAGE_ICON,56,56,LR_DEFAULTCOLOR|LR_SHARED);
+        if(icon)DrawIconEx(dc,32,30,icon,56,56,0,NULL,DI_NORMAL);
         previous_font=(HFONT)SelectObject(dc,font_about_title?font_about_title:font_bold);SetTextColor(dc,CLR_TEXT);
-        SetRect(&text_rect,92,24,client.right-28,24+about_title_height+4);
+        SetRect(&text_rect,108,28,client.right-32,28+about_title_height+4);
         DrawTextW(dc,L"MU投屏",-1,&text_rect,DT_LEFT|DT_TOP|DT_SINGLELINE|DT_NOPREFIX);
         SelectObject(dc,font_normal);SetTextColor(dc,CLR_MUTED);
         _snwprintf(version_text,ARRAYSIZE(version_text)-1,L"版本 %ls",APP_VERSION);version_text[ARRAYSIZE(version_text)-1]=0;
-        SetRect(&text_rect,92,24+about_title_height+2,client.right-28,24+about_title_height+2+normal_font_height+2);
+        SetRect(&text_rect,108,28+about_title_height+4,client.right-32,28+about_title_height+4+normal_font_height+2);
         DrawTextW(dc,version_text,-1,&text_rect,DT_LEFT|DT_TOP|DT_SINGLELINE|DT_NOPREFIX);
         pen=CreatePen(PS_SOLID,1,CLR_BORDER);previous_pen=(HPEN)SelectObject(dc,pen);
-        MoveToEx(dc,28,layout.divider_y,NULL);LineTo(dc,client.right-28,layout.divider_y);
+        MoveToEx(dc,32,layout.divider_y,NULL);LineTo(dc,client.right-32,layout.divider_y);
         SelectObject(dc,previous_pen);DeleteObject(pen);
-        SetTextColor(dc,CLR_MUTED);SetRect(&text_rect,28,layout.component_y,108,layout.component_y+normal_font_height+2);
+        SetTextColor(dc,CLR_MUTED);SetRect(&text_rect,32,layout.component_y,116,layout.component_y+normal_font_height+2);
         DrawTextW(dc,L"内置组件",-1,&text_rect,DT_LEFT|DT_TOP|DT_SINGLELINE|DT_NOPREFIX);
         SetTextColor(dc,CLR_TEXT);_snwprintf(component_text,ARRAYSIZE(component_text)-1,L"scrcpy %ls",scrcpy_version);
-        component_text[ARRAYSIZE(component_text)-1]=0;SetRect(&text_rect,118,layout.component_y,client.right-28,layout.component_y+normal_font_height+2);
+        component_text[ARRAYSIZE(component_text)-1]=0;SetRect(&text_rect,126,layout.component_y,client.right-32,layout.component_y+normal_font_height+2);
         DrawTextW(dc,component_text,-1,&text_rect,DT_LEFT|DT_TOP|DT_SINGLELINE|DT_NOPREFIX);
-        SetTextColor(dc,CLR_MUTED);SetRect(&text_rect,28,layout.homepage_y,108,layout.homepage_y+normal_font_height+2);
+        SetTextColor(dc,CLR_MUTED);SetRect(&text_rect,32,layout.homepage_y,116,layout.homepage_y+normal_font_height+2);
         DrawTextW(dc,L"版本更新",-1,&text_rect,DT_LEFT|DT_TOP|DT_SINGLELINE|DT_NOPREFIX);
+        SetRect(&text_rect,32,layout.source_y,116,layout.source_y+normal_font_height+2);
+        DrawTextW(dc,L"开源地址",-1,&text_rect,DT_LEFT|DT_TOP|DT_SINGLELINE|DT_NOPREFIX);
         SelectObject(dc,previous_font);EndPaint(hwnd,&ps);return 0;
     }
     case WM_COMMAND:
         if(LOWORD(wparam)==IDC_ABOUT_LINK&&HIWORD(wparam)==STN_CLICKED){open_update_page(hwnd);return 0;}
+        if(LOWORD(wparam)==IDC_ABOUT_SOURCE&&HIWORD(wparam)==STN_CLICKED){open_source_page(hwnd);return 0;}
         if(LOWORD(wparam)==IDCANCEL){DestroyWindow(hwnd);return 0;}break;
     case WM_LBUTTONDOWN:case WM_RBUTTONDOWN:case WM_MBUTTONDOWN:
         DestroyWindow(hwnd);return 0;
@@ -1006,7 +1120,9 @@ static LRESULT CALLBACK about_proc(HWND hwnd,UINT message,WPARAM wparam,LPARAM l
         return 0;
     case WM_CTLCOLORSTATIC:
         SetBkMode((HDC)wparam,TRANSPARENT);
-        SetTextColor((HDC)wparam,GetDlgCtrlID((HWND)lparam)==IDC_ABOUT_LINK?CLR_ACCENT:CLR_TEXT);
+        SetTextColor((HDC)wparam,
+                     (GetDlgCtrlID((HWND)lparam)==IDC_ABOUT_LINK||GetDlgCtrlID((HWND)lparam)==IDC_ABOUT_SOURCE)
+                     ?CLR_ACCENT:CLR_TEXT);
         return (LRESULT)brush_bg;
     case WM_CLOSE:DestroyWindow(hwnd);return 0;
     case WM_DESTROY:
@@ -1029,7 +1145,7 @@ static void show_about_window(HWND owner){
         if(!RegisterClassW(&wc)&&GetLastError()!=ERROR_CLASS_ALREADY_EXISTS)return;
         registered=TRUE;
     }
-    layout=get_about_layout();SetRect(&desired,0,0,360,layout.content_height);
+    layout=get_about_layout();SetRect(&desired,0,0,420,layout.content_height);
     AdjustWindowRectEx(&desired,style,FALSE,WS_EX_DLGMODALFRAME);
     width=desired.right-desired.left;height=desired.bottom-desired.top;
     if(GetWindowRect(owner,&owner_rect)){
@@ -1174,6 +1290,12 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
     case WM_TIMER:
         if(wparam==DOCK_TIMER_ID){
             if(dock_scrcpy_window(hwnd,dock_retry_bring_forward)||++dock_retry_count>=30)KillTimer(hwnd,DOCK_TIMER_ID);
+            return 0;
+        }
+        if(wparam==SCRCPY_BOUNDS_TIMER_ID){
+            if(docked_scrcpy_window&&IsWindow(docked_scrcpy_window)){
+                constrain_scrcpy_to_own_monitor(docked_scrcpy_window);
+            }else KillTimer(hwnd,SCRCPY_BOUNDS_TIMER_ID);
             return 0;
         }
         break;
@@ -1321,6 +1443,7 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
         refresh_status_text();layout(hwnd);InvalidateRect(hwnd,NULL,TRUE);return 0;
     case WM_CLOSE:
         KillTimer(hwnd,DOCK_TIMER_ID);
+        KillTimer(hwnd,SCRCPY_BOUNDS_TIMER_ID);
         EnableWindow(hwnd,FALSE);SetEvent(stop_event);terminate_scrcpy();
         if(worker_handle)WaitForSingleObject(worker_handle,3000);
         if(screen_worker_handle)WaitForSingleObject(screen_worker_handle,3000);
